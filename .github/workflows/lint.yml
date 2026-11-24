@@ -1,0 +1,34 @@
+# Lint and story validation, run before anything gets deployed
+name: Lint
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Ruff
+        run: ruff check src/ && ruff format --check src/
+
+      - name: Validate story
+        run: python src/generate_story.py

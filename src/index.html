@@ -8,14 +8,88 @@
     <link rel="stylesheet" href="css/style.css">
     <link rel="stylesheet" href="css/animations.css">
     <link rel="stylesheet" href="css/effects.css">
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- pinned: the unpinned URL silently resolves to 15.0.12, so pin that
+         exact version rather than risk a major release changing rendering -->
+    <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.5.0/dist/purify.min.js"></script>
 </head>
 
 <body>
-    <canvas id="weather-canvas"></canvas>
-    <div id="story-container"></div>
-    <div id="effect-overlay"></div>
+    <canvas id="weather-canvas" aria-hidden="true"></canvas>
+    <div id="scene-image" aria-hidden="true"></div>
+
+    <div id="status" role="status" aria-live="polite" hidden>
+        <p id="status-text">Loading story…</p>
+        <button id="status-retry" type="button" hidden>Try again</button>
+    </div>
+
+    <nav id="toolbar" aria-label="Story controls">
+        <button id="btn-back" type="button" disabled>Back</button>
+        <button id="btn-history" type="button" aria-expanded="false" aria-controls="history-panel">History</button>
+        <button id="btn-skip" type="button">Skip</button>
+        <button id="btn-save" type="button" aria-expanded="false" aria-controls="save-panel">Save</button>
+        <button id="btn-settings" type="button" aria-expanded="false" aria-controls="settings-panel">Settings</button>
+    </nav>
+
+    <section id="history-panel" class="panel" aria-label="Story history" hidden>
+        <div class="panel-head">
+            <h2>History</h2>
+            <button type="button" class="panel-close" data-close="history-panel" aria-label="Close history">&times;</button>
+        </div>
+        <ol id="history-list"></ol>
+    </section>
+
+    <section id="save-panel" class="panel" aria-label="Save slots" hidden>
+        <div class="panel-head">
+            <h2>Save</h2>
+            <button type="button" class="panel-close" data-close="save-panel" aria-label="Close saves">&times;</button>
+        </div>
+        <div id="save-slots"></div>
+    </section>
+
+    <section id="settings-panel" class="panel" aria-label="Settings" hidden>
+        <div class="panel-head">
+            <h2>Settings</h2>
+            <button type="button" class="panel-close" data-close="settings-panel" aria-label="Close settings">&times;</button>
+        </div>
+        <label class="setting">
+            Text speed
+            <input id="set-text-speed" type="range" min="0" max="600" step="25">
+            <output id="set-text-speed-out"></output>
+        </label>
+        <label class="setting">
+            <input id="set-reduced-motion" type="checkbox">
+            Reduce motion
+        </label>
+        <label class="setting">
+            <input id="set-high-contrast" type="checkbox">
+            High contrast text
+        </label>
+        <label class="setting">
+            Volume
+            <input id="set-volume" type="range" min="0" max="100" step="5">
+            <output id="set-volume-out"></output>
+        </label>
+        <label class="setting">
+            <input id="set-mute" type="checkbox">
+            Mute
+        </label>
+        <button type="button" id="set-restart">Restart story</button>
+    </section>
+
+    <main id="story-container" role="log" aria-live="polite" aria-relevant="additions"></main>
+    <div id="effect-overlay" aria-hidden="true"></div>
+
+    <div id="title-screen" hidden>
+        <div class="title-card">
+            <h1 id="title-heading"></h1>
+            <button id="title-start" type="button">New story</button>
+            <button id="title-load" type="button">Load game</button>
+            <button id="title-settings" type="button">Settings</button>
+        </div>
+    </div>
+
     <script src="weather.js"></script>
     <script src="script.js"></script>
 </body>

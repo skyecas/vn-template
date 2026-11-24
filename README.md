@@ -3,9 +3,151 @@ a small template for web based choice engine stories
 
 # Using the template
 
-Write your story
+Write your story as markdown files in `story/`, then generate and validate:
 
-generate and validate
+```
 python3 src/generate_story.py
+```
 
+This checks the whole story for broken links, missing starts/ends, unknown markers and the like,
+then writes `src/story.json`. It must be run from the repo root (it reads `story/` and `src/named_colours`).
 
+Serve the site over HTTP - browsers block `fetch()` on `file://`:
+
+```
+python3 -m http.server
+```
+
+Then open `http://localhost:8000/src/`.
+
+Pass `-DEBUG` (or `-d`) to the generator for a line-by-line trace of what it did with each part.
+
+# Story files
+
+Each file in `story/` is one node. The filename (without `.md`) is the id other nodes link to.
+Put files in a subdirectory to make them variants of the same node; a variant is picked at random
+when the node is reached.
+
+```markdown
+---
+start: true
+revisit: false
+choices:
+    - label: Where do I go next
+      to: next-node
+    - label: What about the ending
+      to: end
+    - label: Only if I found the key
+      to: vault
+      if: has_key
+sets: [met_guard]
+pace: slow
+colour: red
+pov: narrator
+---
+
+The text of the node goes here.
+```
+
+## Frontmatter keys
+
+| key | meaning |
+| --- | --- |
+| `start: true` | a random start node is picked among all nodes marked as start |
+| `end: true` | marks a node as an ending (it should have no choices) |
+| `choices:` | list of choices, see below; empty or missing = dead end |
+| `sets:` | flags raised while this node is on screen, a name or a list of names |
+| `revisit: false` | the node cannot be re-entered through a loop; default is `true` |
+| `pace:` | default pace for the whole node, see `/pace` below |
+| `colour:` | default colour for the whole node, see `/colour` below |
+| `effect:` | default effect for the whole node, see the effects below |
+| `pov:` | default speaker for the whole node, see `/pov` below |
+| `message-pov:` | default speaker for `/message` lines |
+| `message-title:` | default chat-window title |
+| `background:` | background colour on entry, same values as `/background` |
+| `image:` | background image file under `src/images/` on entry; `none` clears it |
+| `music:` | looping track file under `src/audio/` on entry; `none` stops it |
+| `weather:` | weather effect on entry, same values as the weather markers |
+
+Anything referenced by a choice that does not exist is reported as an invalid link.
+
+### Choices
+
+Each choice needs a `label` (what the reader sees) and a `to` (the node id it leads to).
+`if` is optional and names a flag, or a list of flags that all have to be set, before the
+choice is shown:
+
+```yaml
+choices:
+    - label: Open the door
+      to: hallway
+      if: [has_key, saw_notice]
+    - label: Leave
+      to: exit
+```
+
+Flags only ever accumulate within a run: they come from the `sets:` of the nodes visited so
+far, so the browser Back button and the save slots restore exactly the flags that were live
+at that point. The validator warns when a node's choices are *all* gated, because a reader
+missing every flag would have nowhere to go, and when a choice is gated on a flag that
+nothing sets.
+
+## Markers
+
+Colours are either a name from `src/named_colours` or a hex value like `#ef0`.
+
+Line-wide markers must be the only thing on their line: `/pause`, `/background`, `/focus`,
+`/effect reset`, `/weather`, `/sfx` and `/message-title`. Everything else is inline and can sit
+anywhere in the text, with the marker itself stripped out.
+
+| marker | effect |
+| --- | --- |
+| `/pov name` | the rest of the line is spoken by `name`, boxed in its own colour |
+| `/message name` | the line renders as a chat message from `name` |
+| `/message-unsent name` | same, but shown as an unsent message |
+| `/message-title title` | sets the chat window title (line must not contain `/`) |
+| `/colour name` or `/colour #ef0` | text colour for the line; `/reset` returns to default |
+| `/background name` or `/background #ef0` | fades the page background; `/background reset` returns to default |
+| `/focus 80%` | vignette focus around the text; `/focus reset` clears it |
+| `/effect reset` | clears background effects |
+| `/pause 1s` / `/pause 500ms` | waits before continuing |
+| `/pace slow` | scales the typing speed of the line |
+| `/pace 200ms` | absolute ms per line |
+| `/bounce` `/blink` `/glow` `/wave` | animation applied to the line; several can be combined |
+| `/rain` `/snow` `/fog` `/fireflies` `/sunny` | weather effect; `/clear` or `/none` stops it |
+| `/sfx name` | plays `src/audio/name` once; line must contain nothing else |
+
+`fastest`, `faster`, `fast`, `slow`, `slower`, `slowest` are the named paces; their multipliers
+come from `paceMultipliers` in `config.yaml`.
+
+# Configuration
+
+`config.yaml` holds the tuning values: text/choice/fade speeds, colours, text width, pace
+multipliers and the default POV colours. The site loads it directly, so edits take effect on
+reload; the deploy workflow copies it next to `src/` before generating.
+
+# Controls
+
+The toolbar at the top of the page gives you:
+
+- **Back** - undo the last choice (also wired to the browser Back button)
+- **History** - every line read so far
+- **Skip** - fast-forward the current node's remaining text
+- **Save** - three save slots in `localStorage`, with load and delete
+- **Settings** - text speed, reduced motion, high contrast, volume, mute, restart
+
+`Esc` closes any open panel.
+
+# Media
+
+Drop files into `src/images/` (backgrounds) and `src/audio/` (music and sound effects), then
+reference them by filename from frontmatter (`image:`, `music:`) or a `/sfx` marker. The
+validator fails generation if a referenced file is missing. Music loops and crossfades between
+nodes; the volume and mute controls in Settings apply to music and sfx alike.
+
+# Checks
+
+`python3 src/generate_story.py` runs 41 checks over the story. Failures (❌) stop generation and
+exit non-zero; warnings (⚠️) are printed but let the story through. CI runs the same generator,
+plus `ruff check` and `ruff format --check`, on every push and pull request, and deploys to
+GitHub Pages from `main`.

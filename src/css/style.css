@@ -14,16 +14,46 @@ p {
 }
 
 #story-container {
-    max-width: 700px;
+    max-width: var(--max-text-width, 700px);
     width: 100%;
     margin: 0 auto;
-    padding: 2rem;
+    padding: var(--scene-padding, 2rem);
     box-sizing: border-box;
     pointer-events: none;
     height:auto;
     min-height: 100vh;
     padding-bottom: 7.5%;
     background: rgba(0,0,0,0.25);
+}
+
+/* loading and failure notice, centred over the story area */
+#status {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    padding: 2rem;
+    background: rgba(0, 0, 0, 0.85);
+    color: #eee;
+    text-align: center;
+}
+
+#status[hidden] {
+    display: none;
+}
+
+#status-retry {
+    font: inherit;
+    padding: 0.5rem 1.5rem;
+    border: none;
+    border-radius: 4px;
+    background: #0a84ff;
+    color: #fff;
+    cursor: pointer;
 }
 
 .story-node {
@@ -55,7 +85,27 @@ p {
     background: rgba(255, 255, 255, 0.1);
     padding: 0.5rem 1rem;
     border-radius: 4px;
-    text-align: center;transition: opacity 0.4s ease;
+    text-align: center;
+    transition: opacity 0.4s ease;
+    /* choices are real buttons now, so undo the user-agent button styling */
+    font: inherit;
+    color: inherit;
+    border: none;
+    width: 100%;
+    box-sizing: border-box;
+    /* the story container ignores pointer events so text can be selected past;
+       choices are the exception */
+    pointer-events: auto;
+}
+
+.story-choice:disabled {
+    cursor: default;
+    pointer-events: none;
+}
+
+.story-choice:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
 }
 
 .story-choice.redo {
@@ -81,12 +131,6 @@ p {
 
 .story-choice:hover {
     background: rgba(255, 255, 255, 0.15);
-}
-
-.part {
-    /* --pov-color: lightcoral; */
-    border-radius: 1em;
-    padding: 1em;
 }
 
 .story-pov {
@@ -165,6 +209,19 @@ p {
 
 .message.unsent {
     padding-bottom: 1.5em;
+    /* the gentle pulse used to come from the shared .pulse marker effect */
+    animation: unsentPulse 2s infinite;
+}
+@keyframes unsentPulse {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.6;
+    }
 }
 .message.unsent::after {
     content: ". . .";
@@ -173,7 +230,8 @@ p {
     right: 1%;
     transform: translateX(-50%);
     font-size: 1.2em;
-    color: rgba(255, 255, 255, 0.8);
+    color: currentColor;
+    opacity: 0.8;
     font-weight: bold;
     animation: typingWave 1s infinite linear;
 }
@@ -207,6 +265,232 @@ p {
     z-index: 5;
 }
 
-.weather-rain {}
+/* node background image, behind the story text */
+#scene-image {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background-size: cover;
+    background-position: center;
+    opacity: 0;
+    transition: opacity 0.4s ease;
+}
 
-.weather-clear {}
+/* readers who ask for reduced motion get none of the decorative animation;
+   text pacing is handled in script.js so the story still reads in order */
+@media (prefers-reduced-motion: reduce) {
+
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+
+/* ---- controls ---------------------------------------------------------- */
+#toolbar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 15;
+    display: flex;
+    gap: 0.4rem;
+    justify-content: center;
+    flex-wrap: wrap;
+    padding: 0.5rem;
+    background: rgba(0, 0, 0, 0.55);
+    pointer-events: auto;
+}
+
+#toolbar button,
+.panel button,
+#status-retry {
+    font: inherit;
+    font-size: 0.85rem;
+    padding: 0.35rem 0.8rem;
+    border: none;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.15);
+    color: inherit;
+    cursor: pointer;
+}
+
+#toolbar button:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+#toolbar button:focus-visible,
+.panel button:focus-visible,
+#status-retry:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
+}
+
+.panel {
+    position: fixed;
+    top: 3rem;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 18;
+    width: min(34rem, calc(100vw - 2rem));
+    max-height: calc(100vh - 6rem);
+    overflow-y: auto;
+    padding: 1rem;
+    box-sizing: border-box;
+    background: rgba(15, 15, 20, 0.97);
+    color: #eee;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 8px;
+    text-align: left;
+    pointer-events: auto;
+}
+
+.panel[hidden] {
+    display: none;
+}
+
+.panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 0.75rem;
+}
+
+.panel-head h2 {
+    margin: 0;
+    font-size: 1.1rem;
+}
+
+.panel-close {
+    font-size: 1.2rem;
+    line-height: 1;
+    padding: 0.1rem 0.5rem;
+}
+
+#history-list {
+    margin: 0;
+    padding-left: 1.4rem;
+}
+
+#history-list li {
+    margin-bottom: 0.5rem;
+    opacity: 0.85;
+}
+
+#history-list li.has-pov::before {
+    content: attr(data-pov) ": ";
+    font-weight: bold;
+    opacity: 0.7;
+}
+
+.history-empty {
+    list-style: none;
+    margin-left: -1.4rem;
+    opacity: 0.6;
+    font-style: italic;
+}
+
+.save-slot {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.save-slot span {
+    flex: 1;
+}
+
+.setting {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.4rem 0;
+}
+
+.setting input[type="range"] {
+    flex: 1;
+}
+
+#set-restart {
+    margin-top: 0.75rem;
+    background: #0a84ff;
+    color: #fff;
+}
+
+body.high-contrast {
+    --text-colour: #fff;
+}
+
+body.high-contrast #story-container {
+    color: #fff !important;
+    background: rgba(0, 0, 0, 0.75);
+}
+
+body.high-contrast .story-choice {
+    background: rgba(255, 255, 255, 0.3);
+}
+
+/* ---- title screen ------------------------------------------------------ */
+#title-screen {
+    position: fixed;
+    inset: 0;
+    z-index: 12;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem;
+    background: rgba(0, 0, 0, 0.75);
+    pointer-events: auto;
+}
+
+#title-screen[hidden] {
+    display: none;
+}
+
+.title-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    width: min(22rem, 100%);
+    padding: 2rem;
+    box-sizing: border-box;
+    background: rgba(15, 15, 20, 0.97);
+    color: #eee;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 8px;
+    text-align: center;
+}
+
+.title-card h1 {
+    margin: 0 0 0.75rem;
+    font-size: 1.6rem;
+}
+
+.title-card button {
+    font: inherit;
+    padding: 0.6rem 1rem;
+    border: none;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.15);
+    color: inherit;
+    cursor: pointer;
+}
+
+.title-card button:first-of-type {
+    background: #0a84ff;
+    color: #fff;
+}
+
+.title-card button:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
+}

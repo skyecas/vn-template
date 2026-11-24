@@ -30,20 +30,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-      - uses: actions/checkout@v5
+        uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
-          python-version: 'pypy3.10'
+          # CPython, matching what contributors run locally
+          python-version: '3.12'
           cache: 'pip' # caching pip dependencies
       - run: pip install -r requirements.txt
-      - name: copy file
-        uses: canastro/copy-file-action@master
-        with:
-          source: "config.yaml"
-          target: "src/config.yaml"
+      - name: Copy config into the site
+        run: cp config.yaml src/config.yaml
       - run: python src/generate_story.py -DEBUG
-      - run: ls -R src
       - name: Setup Pages
         uses: actions/configure-pages@v5
       - name: Upload artifact
