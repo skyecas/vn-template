@@ -1,11 +1,14 @@
 from __future__ import annotations
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Any, Callable
-from yaml import safe_load
-import sys
-from json import dumps
+
 import re
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from json import dumps
+from pathlib import Path
+from typing import Any
+
+from yaml import safe_load
 
 SPEEDS = "fastest|faster|fast|slowest|slower|slow"
 PACE_PATTERN = re.compile(rf"/({SPEEDS}|pace \d+\s?(ms|s))", re.IGNORECASE)
@@ -39,7 +42,7 @@ META_MESSAGE_TITLE_PATTERN = re.compile(r"^.+$")
 PAUSE_PATTERN = re.compile(r"^/pause \d+\s?(ms|s)$", re.IGNORECASE)
 
 BACKGROUND_EFFECTS_PATTERN = re.compile(
-    r"^/(" + "|".join((r"focus (?:\d+(\.\d+)?\%|reset)", r"effect reset")) + ")",
+    r"^/(" + r"focus (?:\d+(\.\d+)?\%|reset)|effect reset" + ")",
     re.IGNORECASE,
 )
 
@@ -85,7 +88,7 @@ def parse_choices(raw: Any, part: StoryPart | None = None) -> list[Choice]:
     if raw is None:
         return []
     if not isinstance(raw, list):
-        raise ValueError(
+        raise TypeError(
             "choices must be a list of '- label: ... / to: ...' entries, "
             "not a label: target mapping"
         )
@@ -93,7 +96,7 @@ def parse_choices(raw: Any, part: StoryPart | None = None) -> list[Choice]:
     choices = []
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
-            raise ValueError(f"choice {i + 1} must be a mapping with label and to")
+            raise TypeError(f"choice {i + 1} must be a mapping with label and to")
 
         label = entry.get("label")
         target = entry.get("to")
@@ -167,7 +170,7 @@ def find_parts() -> dict[str, StoryParts]:
             raise ValueError(f"{f}: {e}") from e
         try:
             choices = parse_choices(metadata.get("choices"))
-        except ValueError as e:
+        except (ValueError, TypeError) as e:
             raise ValueError(f"{f}: {e}") from e
 
         raw_sets = metadata.get("sets") or []
@@ -214,14 +217,14 @@ def find_parts() -> dict[str, StoryParts]:
 
 def all_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
     nodes = []
-    for _, path in parts.items():
+    for path in parts.values():
         nodes.extend(path.variants)
     return nodes
 
 
 def starting_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
     nodes = []
-    for name, path in parts.items():
+    for path in parts.values():
         if path.is_start:
             nodes.extend(path.variants)
     return nodes
@@ -229,7 +232,7 @@ def starting_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
 
 def ending_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
     nodes = []
-    for _, path in parts.items():
+    for path in parts.values():
         if path.is_end:
             nodes.extend(path.variants)
     return nodes
@@ -237,7 +240,7 @@ def ending_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
 
 def start_end_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
     nodes = []
-    for _, path in parts.items():
+    for path in parts.values():
         if path.is_end and path.is_start:
             nodes.extend(path.variants)
     return nodes
@@ -245,7 +248,7 @@ def start_end_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
 
 def empty_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
     nodes = []
-    for _, path in parts.items():
+    for path in parts.values():
         for part in path.variants:
             if not part.text:
                 nodes.append(part)
@@ -255,7 +258,7 @@ def empty_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
 def duplicate_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
     text = []
     nodes = []
-    for _, path in parts.items():
+    for path in parts.values():
         for part in path.variants:
             if part.text in text:
                 nodes.append(part)
@@ -266,13 +269,13 @@ def duplicate_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
 
 def invalid_links(parts: dict[str, StoryParts]) -> list[StoryPart]:
     nodes = []
-    for _, path in parts.items():
+    for path in parts.values():
         if path.is_end:
             continue
 
         for part in path.variants:
             for choice in part.choices:
-                if choice.target not in parts.keys():
+                if choice.target not in parts:
                     debug(part, f"{choice.target} was not in {parts.keys()}")
                     nodes.append(part)
                     break
@@ -281,7 +284,7 @@ def invalid_links(parts: dict[str, StoryParts]) -> list[StoryPart]:
 
 def dead_ends(parts: dict[str, StoryParts]) -> list[StoryPart]:
     nodes = []
-    for _, path in parts.items():
+    for path in parts.values():
         if not path.is_end:
             for part in path.variants:
                 if not part.choices:
@@ -292,7 +295,7 @@ def dead_ends(parts: dict[str, StoryParts]) -> list[StoryPart]:
 def fully_conditional(parts: dict[str, StoryParts]) -> list[StoryPart]:
     """every choice needs a flag, so a player missing all of them is stuck"""
     nodes = []
-    for _, path in parts.items():
+    for path in parts.values():
         if path.is_end:
             continue
         for part in path.variants:
@@ -315,7 +318,7 @@ def unknown_flags(parts: dict[str, StoryParts]) -> list[StoryPart]:
 
 def continuing_ends(parts: dict[str, StoryParts]) -> list[StoryPart]:
     nodes = []
-    for _, path in parts.items():
+    for path in parts.values():
         if path.is_end:
             for part in path.variants:
                 if part.choices:
@@ -325,7 +328,7 @@ def continuing_ends(parts: dict[str, StoryParts]) -> list[StoryPart]:
 
 def revisit_variants(parts: dict[str, StoryParts]) -> list[StoryPart]:
     nodes = []
-    for _, path in parts.items():
+    for path in parts.values():
         for part in path.variants:
             if path.revisit and not part.revisit:
                 nodes.append(part)
@@ -334,8 +337,8 @@ def revisit_variants(parts: dict[str, StoryParts]) -> list[StoryPart]:
 
 def noncontinuing_variants(parts: dict[str, StoryParts]) -> list[StoryPart]:
     nodes = []
-    for _, path in parts.items():
-        variant_choices = any([len(part.choices) > 0 for part in path.variants])
+    for path in parts.values():
+        variant_choices = any(len(part.choices) > 0 for part in path.variants)
         for part in path.variants:
             if variant_choices and not part.choices:
                 nodes.append(part)
@@ -344,7 +347,7 @@ def noncontinuing_variants(parts: dict[str, StoryParts]) -> list[StoryPart]:
 
 def single_choice(parts: dict[str, StoryParts]) -> list[StoryPart]:
     nodes = []
-    for _, path in parts.items():
+    for path in parts.values():
         if not path.is_end:
             for part in path.variants:
                 if len(part.choices) == 1:
@@ -354,7 +357,7 @@ def single_choice(parts: dict[str, StoryParts]) -> list[StoryPart]:
 
 def duplicate_choices(parts: dict[str, StoryParts]) -> list[StoryPart]:
     nodes = []
-    for _, path in parts.items():
+    for path in parts.values():
         if not path.is_end:
             for part in path.variants:
                 if len(part.choices) != len({choice.target for choice in part.choices}):
@@ -770,7 +773,7 @@ def pretty_print_paths(
         if isinstance(val, StoryPart):
             return val.filepath.name
         elif isinstance(val, list):
-            return sep.join(sorted(set(format_paths(v, depth + 1) for v in val)))
+            return sep.join(sorted({format_paths(v, depth + 1) for v in val}))
         else:
             return str(val)
 
