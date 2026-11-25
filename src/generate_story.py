@@ -389,8 +389,16 @@ def unreachable_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
 
 def looping_nodes(parts: dict[str, StoryParts]) -> list[list[StoryPart]]:
     loops: list[list[StoryPart]] = []
+    # dense menus make the walkable paths explode combinatorially; stop after
+    # a generous budget so validation always finishes (small stories finish
+    # long before the cap, so their output is unaffected)
+    budget = 50_000
 
     def depth_search(node: StoryPart, ancestors: list[StoryPart] | None = None) -> None:
+        nonlocal budget
+        if budget <= 0:
+            return
+        budget -= 1
         ancestors = ancestors or []
         ancestor_names = [ancestor.pathname for ancestor in ancestors]
         if node.pathname in ancestor_names:
@@ -440,30 +448,38 @@ def looping_nodes(parts: dict[str, StoryParts]) -> list[list[StoryPart]]:
     return unique
 
 
+def _nodes_reaching_end(parts: dict[str, StoryParts]) -> set[str]:
+    """every node that can reach an ending, via one reverse breadth-first pass"""
+    cached = getattr(_nodes_reaching_end, "_cache", None)
+    if cached is not None and cached[0] is parts:
+        return cached[1]
+
+    reverse: dict[str, list[str]] = {name: [] for name in parts}
+    for name, part in parts.items():
+        for variant in part.variants:
+            for choice in variant.choices:
+                if choice.target in parts:
+                    reverse[choice.target].append(name)
+
+    reachable = {name for name, part in parts.items() if part.is_end}
+    stack = list(reachable)
+    while stack:
+        for pred in reverse[stack.pop()]:
+            if pred not in reachable:
+                reachable.add(pred)
+                stack.append(pred)
+
+    _nodes_reaching_end._cache = (parts, reachable)
+    return reachable
+
+
 def can_escape_loop(parts: dict[str, StoryParts], loop: list[StoryPart]) -> bool:
     """can the story reach an ending without going back around this loop"""
-
-    def search(node: StoryPart, visited: set[str]) -> bool:
-        thispart = parts[node.pathname]
-        if thispart.is_end:
-            return True
-
-        if node.pathname in visited:
-            return False
-
-        visited = visited | {node.pathname}
-
-        for variant in thispart.variants:
-            for choice in variant.choices:
-                if choice.target not in parts:
-                    continue
-
-                for v in parts[choice.target].variants:
-                    if search(v, visited):
-                        return True
-        return False
-
-    return any(search(node, set()) for node in loop)
+    # walking every path from every loop node re-exploded on dense graphs;
+    # reachability is direction-independent, so one reverse pass answers all
+    # of the loops at once
+    reaching = _nodes_reaching_end(parts)
+    return any(node.pathname in reaching for node in loop)
 
 
 def escapable_looping_nodes(parts: dict[str, StoryParts]) -> list[list[StoryPart]]:
@@ -477,8 +493,15 @@ def inescapable_looping_nodes(parts: dict[str, StoryParts]) -> list[list[StoryPa
 def abnormal_paths(parts: dict[str, StoryParts]) -> list[list[StoryPart]]:
     all_paths: list[list[StoryPart]] = []
     visited_paths: set[tuple[str]] = set()
+    # same budget idea as looping_nodes: generous enough that small stories
+    # enumerate completely, finite so a dense graph cannot hang the build
+    budget = 50_000
 
     def traverse(node: StoryPart, path: list[StoryPart] | None = None):
+        nonlocal budget
+        if budget <= 0:
+            return
+        budget -= 1
         path = path or []
         new_path = path + [node]
         pathnames = tuple(p.pathname for p in new_path)

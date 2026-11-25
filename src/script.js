@@ -56,6 +56,26 @@ async function loadConfig() {
     config = jsyaml.load(configText);
 }
 
+// theme.* in config.yaml is the author's styling block; fold it into the
+// legacy top-level keys so the rest of the engine keeps one source of truth
+function applyTheme() {
+    const theme = config.theme || {};
+    config.textColour = theme.textColour ?? config.textColour ?? "#e8e6e3";
+    config.darkTextColour = theme.darkTextColour ?? config.darkTextColour ?? "#1b1b1f";
+    config.backgroundColour = theme.backgroundColour ?? config.backgroundColour ?? "#0e0e12";
+    config.accentColour = theme.accentColour ?? config.redoButtonColour ?? "#0a84ff";
+    config.povStyle = theme.povStyle === "box" ? "box" : "header";
+
+    const root = document.documentElement.style;
+    root.setProperty("--text", config.textColour);
+    root.setProperty("--dark-text", config.darkTextColour);
+    root.setProperty("--bg", config.backgroundColour);
+    root.setProperty("--accent", config.accentColour);
+    if (theme.font) root.setProperty("--font", theme.font);
+    if (theme.uiFont) root.setProperty("--ui-font", theme.uiFont);
+    if (theme.cornerRadius) root.setProperty("--radius", theme.cornerRadius);
+}
+
 
 async function loadColours() {
     const text = await fetch("named_colours").then(r => r.text());
@@ -342,15 +362,23 @@ function createPOVContainer(pov, partpov = null) {
     const povName = document.createElement("div");
     const colour = parsePOVColour(pov, partpov);
 
-    povContainer.style.borderColor = colour;
-    povContainer.style.background = `
-        linear-gradient(
-            180deg,
-            color-mix(in srgb, ${colour} 30%, transparent) 0%,
-            color-mix(in srgb, ${colour} 10%, transparent) 100%
-        )
-    `;
     povContainer.classList.add("story-pov");
+    if (config.povStyle === "box") {
+        povContainer.classList.add("pov-box");
+        povContainer.style.borderColor = colour;
+        povContainer.style.background = `
+            linear-gradient(
+                180deg,
+                color-mix(in srgb, ${colour} 30%, transparent) 0%,
+                color-mix(in srgb, ${colour} 10%, transparent) 100%
+            )
+        `;
+    } else {
+        // header style: a coloured heading and a hairline, no box
+        povContainer.classList.add("pov-header");
+        povContainer.style.borderTopColor = colour;
+        povContainer.style.borderBottomColor = `color-mix(in srgb, ${colour} 35%, transparent)`;
+    }
 
     povName.style.color = colour;
     povName.textContent = pov;
@@ -745,7 +773,7 @@ function redoButton() {
     button.type = "button";
     button.className = "story-choice redo";
     button.textContent = "Restart story";
-    button.style.backgroundColor = config.redoButtonColour || "#0a84ff";
+    button.style.backgroundColor = config.accentColour || "#0a84ff";
     button.style.opacity = 1;
 
     // handle the reset action
@@ -1162,6 +1190,14 @@ function openPanel(btnId) {
 }
 
 function initControls() {
+    // panels and the story column offset themselves from the live toolbar
+    // height, which changes when the buttons wrap on narrow screens
+    const toolbar = document.getElementById("toolbar");
+    const syncToolbar = () =>
+        document.documentElement.style.setProperty("--toolbar-height", `${toolbar.offsetHeight}px`);
+    new ResizeObserver(syncToolbar).observe(toolbar);
+    syncToolbar();
+
     const toggles = [
         ["btn-history", "history-panel"],
         ["btn-save", "save-panel"],
@@ -1257,6 +1293,7 @@ async function initStory() {
     showStatus("Loading story…");
     try {
         await loadConfig();
+        applyTheme();
         await loadColours();
         updatePOVColours(config.povColours);
 

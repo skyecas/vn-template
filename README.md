@@ -102,7 +102,7 @@ anywhere in the text, with the marker itself stripped out.
 
 | marker | effect |
 | --- | --- |
-| `/pov name` | the rest of the line is spoken by `name`, boxed in its own colour |
+| `/pov name` | the rest of the line is spoken by `name`, marked in its own colour (see `theme.povStyle`) |
 | `/message name` | the line renders as a chat message from `name` |
 | `/message-unsent name` | same, but shown as an unsent message |
 | `/message-title title` | sets the chat window title (line must not contain `/`) |
@@ -126,6 +126,19 @@ come from `paceMultipliers` in `config.yaml`.
 multipliers and the default POV colours. The site loads it directly, so edits take effect on
 reload; the deploy workflow copies it next to `src/` before generating.
 
+The `theme:` block is the story's visual identity, applied before a reader ever touches
+Settings:
+
+- `font` / `uiFont` - font stacks for the story text and for the controls
+- `textColour` / `darkTextColour` / `backgroundColour` - the core palette
+- `accentColour` - primary buttons, hovers and focus rings
+- `cornerRadius` - rounding for buttons, choices and panels
+- `povStyle` - `header` for a subtle coloured heading over the block, or `box` for the
+  original outlined panel
+
+The older top-level `textColour`, `darkTextColour`, `backgroundColour` and `redoButtonColour`
+keys still work; `theme:` wins when both are present.
+
 # Controls
 
 The toolbar at the top of the page gives you:
@@ -144,6 +157,10 @@ Drop files into `src/images/` (backgrounds) and `src/audio/` (music and sound ef
 reference them by filename from frontmatter (`image:`, `music:`) or a `/sfx` marker. The
 validator fails generation if a referenced file is missing. Music loops and crossfades between
 nodes; the volume and mute controls in Settings apply to music and sfx alike.
+
+A demo set ships with the template (`demo-room.png`, `demo-loop.wav`, `blip.wav`,
+`confirm.wav`, `success.wav`) so the demo pages have something to play; replace or delete them
+once your own media goes in.
 
 # Checks
 
