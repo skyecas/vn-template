@@ -7,6 +7,11 @@ backgroundTransitionTime: 2000     # ms when fading between background colour st
 
 maxTextWidth: 700
 
+# ms to wait after a node's text finishes before auto-following its only
+# choice; 0 disables it (the reader clicks instead). Only ever fires when a
+# node has exactly one choice, so branching points are never guessed at
+autoAdvance: 0
+
 scenePadding: "2rem"
 paceMultipliers:
   fastest: 0.125

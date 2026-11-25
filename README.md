@@ -57,6 +57,7 @@ The text of the node goes here.
 | `end: true` | marks a node as an ending (it should have no choices) |
 | `choices:` | list of choices, see below; empty or missing = dead end |
 | `sets:` | flags raised while this node is on screen, a name or a list of names |
+| `vars:` | numeric variables set on entry, a `name: value` map; see Variables below |
 | `revisit: false` | the node cannot be re-entered through a loop; default is `true` |
 | `pace:` | default pace for the whole node, see `/pace` below |
 | `colour:` | default colour for the whole node, see `/colour` below |
@@ -74,14 +75,17 @@ Anything referenced by a choice that does not exist is reported as an invalid li
 ### Choices
 
 Each choice needs a `label` (what the reader sees) and a `to` (the node id it leads to).
-`if` is optional and names a flag, or a list of flags that all have to be set, before the
-choice is shown:
+`if` is optional and gates the choice. Each entry in `if` is either a flag name (or `not flag`),
+or a numeric comparison like `score >= 3`; a list needs every entry to pass:
 
 ```yaml
 choices:
     - label: Open the door
       to: hallway
       if: [has_key, saw_notice]
+    - label: Use the lockpick
+      to: hallway
+      if: [not alarmed, skill >= 5]
     - label: Leave
       to: exit
 ```
@@ -91,6 +95,38 @@ far, so the browser Back button and the save slots restore exactly the flags tha
 at that point. The validator warns when a node's choices are *all* gated, because a reader
 missing every flag would have nowhere to go, and when a choice is gated on a flag that
 nothing sets.
+
+## Conditional text
+
+`/if`, an optional `/else`, and `/endif` show or hide whole lines based on the same conditions
+a choice uses. The markers are stripped; only the matching lines render, and hidden lines never
+enter the history:
+
+```markdown
+/if has_key
+The lock opens.
+/else
+The door stays shut.
+/endif
+```
+
+Blocks nest, and a condition can be a flag, `not flag`, or a numeric comparison.
+
+## Variables
+
+`vars:` in the front matter tracks anything that counts - a score, health, gold. A plain number
+assigns the value; a quoted `"+1"` or `"-2"` string adjusts it:
+
+```yaml
+vars:
+    score: 5
+    gold: "+10"
+```
+
+Write `{name}` anywhere in the text and it is replaced with the current value when the line
+renders (`Your score is {score}`). Variables also drive `if:` on choices and `/if` blocks
+through comparisons (`score >= 3`, with `>`, `>=`, `<`, `<=`, `==`, `!=`). They carry through
+Back, saves and the URL like flags do.
 
 ## Markers
 
@@ -126,6 +162,11 @@ come from `paceMultipliers` in `config.yaml`.
 multipliers and the default POV colours. The site loads it directly, so edits take effect on
 reload; the deploy workflow copies it next to `src/` before generating.
 
+`autoAdvance` (ms) makes a linear story read hands-off: after a node's text finishes, its only
+choice is followed automatically once the delay elapses. It only ever fires when a node has
+exactly one choice, so branching points are never guessed at, and any reader input cancels it.
+`0` (the default) disables it.
+
 The `theme:` block is the story's visual identity, applied before a reader ever touches
 Settings:
 
@@ -151,6 +192,12 @@ The toolbar at the top of the page gives you:
 
 `Esc` closes any open panel.
 
+While reading you can also:
+
+- **Click anywhere** (or press `Space` / `Enter`) - finish the current line's reveal, or, when
+  the story is at a single choice, follow it; a branching point still needs an explicit pick
+- **`1`-`9`** - pick that numbered choice directly
+
 # Media
 
 Drop files into `src/images/` (backgrounds) and `src/audio/` (music and sound effects), then
@@ -164,7 +211,7 @@ once your own media goes in.
 
 # Checks
 
-`python3 src/generate_story.py` runs 41 checks over the story. Failures (❌) stop generation and
+`python3 src/generate_story.py` runs 44 checks over the story. Failures (❌) stop generation and
 exit non-zero; warnings (⚠️) are printed but let the story through. CI runs the same generator,
 plus `ruff check` and `ruff format --check`, on every push and pull request, and deploys to
 GitHub Pages from `main`.

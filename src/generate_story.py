@@ -52,6 +52,21 @@ META_WEATHER_PATTERN = re.compile(rf"^({WEATHER_TYPES})$", re.IGNORECASE)
 
 SFX_PATTERN = re.compile(r"^/sfx ([\w.-]+)$", re.IGNORECASE)
 
+# conditional text blocks: /if <condition> ... [/else] ... /endif
+IF_PATTERN = re.compile(r"^/if\s+(.+)$", re.IGNORECASE)
+ELSE_PATTERN = re.compile(r"^/else$", re.IGNORECASE)
+ENDIF_PATTERN = re.compile(r"^/endif$", re.IGNORECASE)
+# strips a whole conditional marker so unknown_markers does not flag it
+CONDITIONAL_STRIP_PATTERN = re.compile(r"^/(?:if\s+.+|else|endif)$", re.IGNORECASE)
+
+# a condition is either a (possibly negated) flag name, or a numeric
+# comparison against a variable: score >= 10
+COMPARE_OPERATORS = r">=|<=|==|!=|>|<"
+CONDITION_COMPARE_PATTERN = re.compile(
+    rf"^(.+?)\s*({COMPARE_OPERATORS})\s*(-?\d+(?:\.\d+)?)$"
+)
+CONDITION_FLAG_PATTERN = re.compile(r"^(?:not\s+)?([^<>=]+)$")
+
 # values that mean "turn it off" rather than naming a file
 CLEAR_VALUES = {"none", "reset", "clear"}
 
@@ -62,6 +77,38 @@ def debug(part: StoryPart | None = None, msg: str = ""):
             print(f" - {part.pathname}: {msg}")
         else:
             print(f" - {msg}")
+
+
+def condition_is_var(condition: str) -> bool:
+    """a numeric comparison rather than a plain flag check"""
+    inner = re.sub(r"^not\s+", "", condition.strip(), flags=re.IGNORECASE)
+    return bool(CONDITION_COMPARE_PATTERN.match(inner))
+
+
+def condition_reference(condition: str) -> str:
+    """the flag or variable name a condition reads"""
+    inner = re.sub(r"^not\s+", "", condition.strip(), flags=re.IGNORECASE)
+    match = CONDITION_COMPARE_PATTERN.match(inner)
+    return match.group(1).strip() if match else inner.strip()
+
+
+def condition_error(condition: str) -> str | None:
+    """None when the condition parses, else a message explaining why not"""
+    if CONDITION_COMPARE_PATTERN.match(condition.strip()):
+        return None
+    if CONDITION_FLAG_PATTERN.match(condition.strip()):
+        return None
+    return f"cannot parse condition {condition!r}"
+
+
+def part_conditions(part: StoryPart) -> list[str]:
+    """every condition a part reads: choice gates plus /if markers in text"""
+    conditions = [c for choice in part.choices for c in choice.condition]
+    for line in part.text.splitlines():
+        match = IF_PATTERN.match(line.strip())
+        if match:
+            conditions.append(match.group(1))
+    return conditions
 
 
 @dataclass
@@ -139,6 +186,8 @@ class StoryPart:
     choices: list[Choice] = field(default_factory=list)
     # flags raised while this part is on screen
     sets: list[str] = field(default_factory=list)
+    # numeric variables while this part is on screen: name -> number or "+n"/"-n"
+    vars: dict[str, Any] = field(default_factory=dict)
     # background image file under src/images/
     image: str | None = None
     # looping track file under src/audio/
@@ -181,9 +230,28 @@ def find_parts() -> dict[str, StoryParts]:
         ):
             raise ValueError(f"{f}: sets must be a flag name or list of flag names")
 
+        raw_vars = metadata.get("vars") or {}
+        if not isinstance(raw_vars, dict) or not all(
+            isinstance(k, str) for k in raw_vars
+        ):
+            raise ValueError(f"{f}: vars must be a mapping of name: value")
+        for vname, vvalue in raw_vars.items():
+            is_number = isinstance(vvalue, (int, float)) and not isinstance(
+                vvalue, bool
+            )
+            is_delta = (
+                isinstance(vvalue, str)
+                and re.fullmatch(r"[+-]\d+(?:\.\d+)?", vvalue.strip()) is not None
+            )
+            if not (is_number or is_delta):
+                raise ValueError(
+                    f'{f}: vars.{vname} must be a number or a "+n"/"-n" string'
+                )
+
         this_part = StoryPart(
             choices=choices,
             sets=raw_sets,
+            vars=raw_vars,
             text=body,
             filepath=f,
             pathname=pathname,
@@ -305,14 +373,80 @@ def fully_conditional(parts: dict[str, StoryParts]) -> list[StoryPart]:
 
 
 def unknown_flags(parts: dict[str, StoryParts]) -> list[StoryPart]:
-    """choices gated on a flag that no part ever sets"""
+    """choices or /if blocks gated on a flag that no part ever sets"""
     set_flags = {flag for part in all_nodes(parts) for flag in part.sets}
     nodes = []
     for path in parts.values():
         for part in path.variants:
-            needed = {flag for choice in part.choices for flag in choice.condition}
+            needed = {
+                condition_reference(c)
+                for c in part_conditions(part)
+                if not condition_is_var(c)
+            }
             if needed - set_flags:
                 nodes.append(part)
+    return nodes
+
+
+def unknown_vars(parts: dict[str, StoryParts]) -> list[StoryPart]:
+    """conditions reading a variable that no part ever assigns"""
+    set_vars = {name for part in all_nodes(parts) for name in part.vars}
+    nodes = []
+    for path in parts.values():
+        for part in path.variants:
+            needed = {
+                condition_reference(c)
+                for c in part_conditions(part)
+                if condition_is_var(c)
+            }
+            if needed - set_vars:
+                nodes.append(part)
+                debug(part, "unknown variables: " + ", ".join(needed - set_vars))
+    return nodes
+
+
+def condition_syntax(parts: dict[str, StoryParts]) -> list[StoryPart]:
+    """conditions that are neither a flag name nor a numeric comparison"""
+    nodes = []
+    for path in parts.values():
+        for part in path.variants:
+            for condition in part_conditions(part):
+                if error := condition_error(condition):
+                    nodes.append(part)
+                    debug(part, error)
+                    break
+    return nodes
+
+
+def conditional_blocks(parts: dict[str, StoryParts]) -> list[StoryPart]:
+    """/if, /else and /endif must nest correctly within each part"""
+    nodes = []
+    for path in parts.values():
+        for part in path.variants:
+            stack: list[bool] = []  # one entry per open /if, tracks a seen /else
+            problem = None
+            for lineno, line in enumerate(part.text.splitlines(), 1):
+                stripped = line.strip()
+                if IF_PATTERN.match(stripped):
+                    stack.append(False)
+                elif ELSE_PATTERN.match(stripped):
+                    if not stack:
+                        problem = f"/else on line {lineno} with no open /if"
+                        break
+                    if stack[-1]:
+                        problem = f"second /else on line {lineno}"
+                        break
+                    stack[-1] = True
+                elif ENDIF_PATTERN.match(stripped):
+                    if not stack:
+                        problem = f"/endif on line {lineno} with no open /if"
+                        break
+                    stack.pop()
+            if problem is None and stack:
+                problem = "an /if is never closed with /endif"
+            if problem:
+                nodes.append(part)
+                debug(part, problem)
     return nodes
 
 
@@ -352,6 +486,13 @@ def single_choice(parts: dict[str, StoryParts]) -> list[StoryPart]:
             for part in path.variants:
                 if len(part.choices) == 1:
                     nodes.append(part)
+    # a story where every continuing part has exactly one choice is a linear
+    # narrative on purpose; warning about each chapter is just noise
+    continuing = [
+        part for path in parts.values() if not path.is_end for part in path.variants
+    ]
+    if continuing and len(nodes) == len(continuing):
+        return []
     return nodes
 
 
@@ -569,6 +710,7 @@ def unknown_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
                     WEATHER_PATTERN,
                     SFX_PATTERN,
                     BACKGROUND_EFFECTS_PATTERN,
+                    CONDITIONAL_STRIP_PATTERN,
                 ]:
                     stripped = regex.sub("", stripped)
 
@@ -765,6 +907,7 @@ def generate_json(parts: dict[str, StoryParts]) -> dict[str, Any]:
                     "text": v.text,
                 }
                 | ({"sets": v.sets} if v.sets else {})
+                | ({"vars": v.vars} if v.vars else {})
                 | ({"image": v.image} if v.image else {})
                 | ({"music": v.music} if v.music else {})
                 | ({"pace": v.pace} if v.pace else {})
@@ -862,6 +1005,9 @@ def main() -> int:
         StoryCheck(dead_ends, "parts with no choices"),
         StoryCheck(fully_conditional, "parts where every choice needs a flag", False),
         StoryCheck(unknown_flags, "parts gating on a flag nothing sets", False),
+        StoryCheck(unknown_vars, "parts reading a variable nothing sets", False),
+        StoryCheck(condition_syntax, "parts with unparseable conditions"),
+        StoryCheck(conditional_blocks, "parts with unbalanced /if blocks"),
         StoryCheck(continuing_ends, "ending parts contain choices"),
         StoryCheck(noncontinuing_variants, "parts with choices on only some variants"),
         StoryCheck(revisit_variants, "parts are revisitable while others aren't"),

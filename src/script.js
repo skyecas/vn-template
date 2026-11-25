@@ -86,7 +86,7 @@ async function loadColours() {
 
 // URL to state and back
 function emptyState() {
-    return { path: [], variants: [], povColours: {}, flags: [] };
+    return { path: [], variants: [], povColours: {}, flags: [], vars: {} };
 }
 
 // a shared link can be stale or hand edited, never trust its shape
@@ -116,7 +116,16 @@ function sanitizeState(state) {
         ? state.flags.filter(flag => typeof flag === "string")
         : [];
 
-    return { path, variants, povColours, flags };
+    const vars = {};
+    if (state.vars && typeof state.vars === "object" && !Array.isArray(state.vars)) {
+        for (const [key, value] of Object.entries(state.vars)) {
+            if (typeof key === "string" && typeof value === "number" && isFinite(value)) {
+                vars[key] = value;
+            }
+        }
+    }
+
+    return { path, variants, povColours, flags, vars };
 }
 
 function loadStateFromURL() {
@@ -131,7 +140,7 @@ function loadStateFromURL() {
 }
 
 function statePayload(path, variants) {
-    return JSON.stringify({ path, variants, povColours, flags: [...currentFlags] });
+    return JSON.stringify({ path, variants, povColours, flags: [...currentFlags], vars: { ...currentVars } });
 }
 
 function saveStateToURL(path, variants) {
@@ -187,6 +196,25 @@ let storyHistory = [];
 // flags raised by the nodes visited so far; every state snapshot carries
 // them so Back and saves restore the same set
 let currentFlags = new Set();
+
+// numeric variables raised by nodes visited so far; same deal, carried in
+// every snapshot so Back and saves restore them
+let currentVars = {};
+
+// true while a node's lines are still fading in, so a click can fast-forward
+// the reveal instead of advancing the story
+let textRevealing = false;
+
+// pending auto-follow of a linear node's only choice; cancelled the moment
+// the reader interacts so it never races their own click
+let autoAdvanceTimer = null;
+
+function cancelAutoAdvance() {
+    if (autoAdvanceTimer) {
+        clearTimeout(autoAdvanceTimer);
+        autoAdvanceTimer = null;
+    }
+}
 
 // helper functions
 const statusEl = document.getElementById("status");
@@ -628,6 +656,7 @@ async function renderText(nodeContainer, node, variantIdx) {
     nodeContainer.appendChild(storyPart);
 
     const variant = node.variants[variantIdx];
+    textRevealing = true;
 
     // extract the node colour choice
     const partColour = variant.colour;
@@ -666,7 +695,32 @@ async function renderText(nodeContainer, node, variantIdx) {
 
     // print the lines
     const lines = variant.text.split("\n").filter(elem => elem.trim());
+    // conditional blocks: /if <cond> ... [/else] ... /endif; a line renders
+    // only when every enclosing block is showing
+    const condStack = [];
+    const showing = () => condStack.every(entry => entry.show);
     for (const line of lines) {
+        const stripped = line.trim();
+
+        const ifMatch = stripped.match(/^\/if\s+(.+)$/i);
+        if (ifMatch) {
+            condStack.push({ show: evalCondition(ifMatch[1]), orElse: false });
+            continue;
+        }
+        if (/^\/else$/i.test(stripped)) {
+            const entry = condStack[condStack.length - 1];
+            if (entry) entry.show = !entry.show;
+            continue;
+        }
+        if (/^\/endif$/i.test(stripped)) {
+            condStack.pop();
+            continue;
+        }
+
+        // inside a block whose condition failed: skip the line entirely, so it
+        // never renders, never enters history, and never fires a command
+        if (!showing()) continue;
+
         // single line commands that should exit early
         const foundtitle = extractRegexArg(line, MESSAGE_TITLE_PATTERN)[0];
         if (foundtitle) {
@@ -724,9 +778,15 @@ async function renderText(nodeContainer, node, variantIdx) {
         const [unsentmessagepov, unsentlesstext] = extractRegexArg(povlesstext, MESSAGE_UNSENT_PATTERN);
         const [messagepov, messagelesstext] = extractRegexArg(unsentlesstext, MESSAGE_PATTERN);
 
+        // substitute {name} references to numeric variables so a score or
+        // health value can appear inline; unknown names are left alone
+        const substituted = messagelesstext.replace(/\{(\w+)\}/g, (m, name) =>
+            name in currentVars ? String(currentVars[name]) : m
+        );
+
         // parse markdown to html; marked allows raw html through, so it goes
         // into innerHTML only after DOMPurify has stripped anything active
-        storyLine.innerHTML = DOMPurify.sanitize(marked.parse(messagelesstext));
+        storyLine.innerHTML = DOMPurify.sanitize(marked.parse(substituted));
 
         storyHistory.push({ html: storyLine.innerHTML, pov: pov || partpov });
 
@@ -751,6 +811,25 @@ async function renderText(nodeContainer, node, variantIdx) {
         storyLine.dataset.speed = speed;
         await fadeText(storyLine);
     }
+    textRevealing = false;
+}
+
+// the choices the reader can pick right now: the current node's, once they
+// have finished fading in (past choices stay disabled)
+function activeChoiceButtons() {
+    return [...storyContainer.querySelectorAll(".story-choice.active:not(:disabled)")];
+}
+
+// click / Space / Enter: finish the text reveal if it is still going, else
+// follow the one choice when the story is linear at this point
+function advanceOrReveal() {
+    cancelAutoAdvance();
+    if (textRevealing) {
+        triggerSkip();
+        return;
+    }
+    const choices = activeChoiceButtons();
+    if (choices.length === 1) choices[0].click();
 }
 
 function unselectChoices() {
@@ -790,14 +869,44 @@ function normaliseChoices(choices) {
 
 function visitable(path, choices) {
     return normaliseChoices(choices).filter(choice => {
-        // gated on a flag the reader has not set yet
-        if (choice.if && !choice.if.every(flag => currentFlags.has(flag))) return false;
+        // gated on a condition the reader has not satisfied yet
+        if (choice.if && !choice.if.every(evalCondition)) return false;
 
         const node = storyData[choice.to];
         if (!node) return true; // unimplemented, sure, let it show
         const alreadyVisited = path.slice(0, lastNode + 2).includes(choice.to);
         return !alreadyVisited || node.revisit;
     });
+}
+
+// a condition is a (possibly negated) flag name, or a numeric comparison
+// against a variable: score >= 10
+function evalCondition(condition) {
+    let cond = String(condition).trim();
+    let negate = false;
+    if (/^not\s+/i.test(cond)) {
+        negate = true;
+        cond = cond.replace(/^not\s+/i, "").trim();
+    }
+
+    let result;
+    const cmp = cond.match(/^(.+?)\s*(>=|<=|==|!=|>|<)\s*(-?\d+(?:\.\d+)?)$/);
+    if (cmp) {
+        const current = currentVars[cmp[1].trim()] ?? 0;
+        const target = parseFloat(cmp[3]);
+        switch (cmp[2]) {
+            case ">=": result = current >= target; break;
+            case "<=": result = current <= target; break;
+            case ">": result = current > target; break;
+            case "<": result = current < target; break;
+            case "==": result = current === target; break;
+            case "!=": result = current !== target; break;
+        }
+    } else {
+        result = currentFlags.has(cond);
+    }
+
+    return negate ? !result : result;
 }
 
 
@@ -876,12 +985,27 @@ async function renderChoices(nodeContainer, path, variants, storyIndex, node, va
         for (const button of buttons) {
             button.disabled = false;
         }
+
+        // a linear node can follow its only choice on its own, so a story
+        // reads hands-off; any reader input cancels it first
+        const delay = Number(config.autoAdvance) || 0;
+        const live = activeChoiceButtons();
+        if (delay > 0 && live.length === 1) {
+            cancelAutoAdvance();
+            autoAdvanceTimer = setTimeout(() => {
+                autoAdvanceTimer = null;
+                const now = activeChoiceButtons();
+                if (now.length === 1) now[0].click();
+            }, delay);
+        }
     }
 }
 
 async function renderNode(path, variants, storyIndex, node, variantIdx) {
     // a skip only lasts for the node it was pressed during
     skipMode = false;
+    // any pending auto-follow belongs to the node we are leaving
+    cancelAutoAdvance();
 
     // flags this node raises become live as soon as it is on screen, ahead
     // of its own choices being filtered
@@ -890,6 +1014,23 @@ async function renderNode(path, variants, storyIndex, node, variantIdx) {
         const raised = variant.sets.filter(flag => !currentFlags.has(flag));
         for (const flag of raised) currentFlags.add(flag);
         if (raised.length) syncStateToURL();
+    }
+
+    // numeric variables are applied the same way; a plain number sets the
+    // value, a "+n"/"-n" string adjusts it
+    if (variant && variant.vars && Object.keys(variant.vars).length) {
+        let changed = false;
+        for (const [name, value] of Object.entries(variant.vars)) {
+            if (typeof value === "number") {
+                if (currentVars[name] !== value) changed = true;
+                currentVars[name] = value;
+            } else {
+                const delta = parseFloat(value);
+                currentVars[name] = (currentVars[name] ?? 0) + delta;
+                changed = true;
+            }
+        }
+        if (changed) syncStateToURL();
     }
 
     // create the node container
@@ -967,7 +1108,9 @@ function clearView() {
     lastNode = -1;
     storyHistory = [];
     skipMode = false;
+    cancelAutoAdvance();
     currentFlags = new Set();
+    currentVars = {};
     appliedImage = null;
     sceneImage.style.opacity = 0;
     sceneImage.style.backgroundImage = "";
@@ -1010,6 +1153,7 @@ window.addEventListener("popstate", () => {
     const state = loadStateFromURL();
     clearView();
     currentFlags = new Set(state.flags);
+    currentVars = { ...state.vars };
     updatePOVColours(state.povColours);
     updateBackButton();
     if (!state.path.length) {
@@ -1115,6 +1259,7 @@ function renderSaveSlots() {
                     variants: [...currentVariants],
                     povColours: { ...povColours },
                     flags: [...currentFlags],
+                    vars: { ...currentVars },
                     savedAt: Date.now(),
                 },
             });
@@ -1133,6 +1278,7 @@ function renderSaveSlots() {
             hideTitle();
             clearView();
             currentFlags = new Set(latest.flags || []);
+            currentVars = { ...(latest.vars || {}) };
             updatePOVColours(latest.povColours);
             const url = new URL(window.location);
             url.searchParams.set("state", btoa(JSON.stringify(latest)));
@@ -1219,7 +1365,36 @@ function initControls() {
     }
 
     document.addEventListener("keydown", e => {
-        if (e.key === "Escape") closeAllPanels();
+        if (e.key === "Escape") { closeAllPanels(); return; }
+
+        // never hijack keys while a form control has focus
+        if (e.target.closest("input, textarea, select")) return;
+
+        // Space / Enter: finish the reveal, or follow the lone choice; when a
+        // control itself has focus, let its native activation handle the key
+        if (e.key === " " || e.key === "Enter") {
+            if (e.target.closest("button, a")) return;
+            e.preventDefault();
+            advanceOrReveal();
+            return;
+        }
+
+        // 1-9 picks that numbered choice
+        if (/^[1-9]$/.test(e.key)) {
+            const choices = activeChoiceButtons();
+            const picked = choices[Number(e.key) - 1];
+            if (picked) {
+                e.preventDefault();
+                picked.click();
+            }
+        }
+    });
+
+    // click anywhere that is not a control: finish the reveal, or follow the
+    // lone choice (a branching point still needs an explicit pick)
+    document.addEventListener("click", e => {
+        if (e.target.closest("button, a, input, textarea, select, .panel, #toolbar, #title-screen")) return;
+        advanceOrReveal();
     });
 
     document.getElementById("btn-back").addEventListener("click", () => window.history.back());
@@ -1319,6 +1494,7 @@ async function initStory() {
 
         updatePOVColours(state["povColours"]);
         currentFlags = new Set(state.flags);
+        currentVars = { ...state.vars };
 
         loadSettings();
         applySettings();
