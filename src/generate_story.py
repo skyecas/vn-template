@@ -93,6 +93,7 @@ NODE_KEYS = {
     "image",
     "music",
     "choices",
+    "choices_from",
 }
 CHOICE_KEYS = {"label", "to", "if"}
 
@@ -806,6 +807,37 @@ def parse_choices(raw: Any, filepath: Path, unknown: list[str]) -> list[ChoiceIR
     return choices
 
 
+def load_choices_from(
+    ref: str,
+    filepath: Path,
+    unknown: list[str],
+    seen: frozenset[str] = frozenset(),
+) -> list[ChoiceIR]:
+    """merge a shared file's frontmatter choices (design 1.8)"""
+    if ref in seen:
+        raise ValueError(f"{filepath}: choices_from cycle via {ref}")
+    if not ref.startswith("_"):
+        raise ValueError(
+            f"{filepath}: choices_from must point at a '_' file, got {ref!r}"
+        )
+    target = Path("story") / f"{ref}.md"
+    if not target.is_file():
+        raise ValueError(f"{filepath}: choices_from file not found: {ref}")
+
+    try:
+        metadata, _body = parse_markdown(target.read_text("utf-8"))
+    except ValueError as e:
+        raise ValueError(f"{target}: {e}") from e
+    if metadata.get("choices") is None:
+        raise ValueError(f"{filepath}: choices_from file has no choices: {ref}")
+
+    merged = parse_choices(metadata.get("choices"), target, unknown)
+    chained = metadata.get("choices_from")
+    if chained is not None:
+        merged += load_choices_from(str(chained), target, unknown, seen | {ref})
+    return merged
+
+
 def parse_front_effects(metadata: dict[str, Any], filepath: Path) -> list[dict]:
     """sets/clear/vars frontmatter -> one effects list (design 1.2/1.5)"""
     effects: list[dict] = []
@@ -878,6 +910,13 @@ def find_parts() -> dict[str, NodeIR]:
         unknown = [f"node key {key!r}" for key in metadata if key not in NODE_KEYS]
         try:
             choices = parse_choices(metadata.get("choices"), f, unknown)
+            if metadata.get("choices_from") is not None:
+                choices += load_choices_from(str(metadata["choices_from"]), f, unknown)
+                labels = [choice.label for choice in choices]
+                if len(labels) != len(set(labels)):
+                    raise ValueError(
+                        "choices must have unique labels (incl. choices_from)"
+                    )
             effects = parse_front_effects(metadata, f)
         except (ValueError, TypeError) as e:
             raise ValueError(f"{f}: {e}") from e
@@ -1220,12 +1259,17 @@ def unreachable_nodes(parts: dict[str, NodeIR]) -> list[VariantIR]:
             continue
 
         visited.add(node.pathname)
-        if parts[node.pathname].is_end:
+        path = parts[node.pathname]
+        if path.is_end:
             continue
 
         for choice in node.choices:
             if choice.target in parts:
                 stack.extend(parts[choice.target].variants)
+        # next is a structural edge too (design 1.2): a node only reachable
+        # through a continuation is still reachable
+        if path.next and path.next in parts:
+            stack.extend(parts[path.next].variants)
     return [node for node in every_node if node.pathname not in visited]
 
 

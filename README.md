@@ -56,8 +56,11 @@ The text of the node goes here.
 | `start: true` | a random start node is picked among all nodes marked as start |
 | `end: true` | marks a node as an ending (it should have no choices) |
 | `choices:` | list of choices, see below; empty or missing = dead end |
+| `choices_from:` | path of a `_` file whose `choices:` are appended after this node's own; see Shared menus below |
 | `sets:` | flags raised while this node is on screen, a name or a list of names |
 | `vars:` | numeric variables set on entry, a `name: value` map; see Variables below |
+| `next:` | node id to continue to automatically; see Automatic continuation below |
+| `if` (with `next`) | condition for the continuation; when false the page falls through to its choices |
 | `revisit: false` | the node cannot be re-entered through a loop; default is `true` |
 | `pace:` | default pace for the whole node, see `/pace` below |
 | `colour:` | default colour for the whole node, see `/colour` below |
@@ -113,6 +116,48 @@ if: has_key and (skill >= 5 or not alarmed)
 
 Expressions combine flag names, `not`, comparisons (`>`, `>=`, `<`, `<=`, `==`, `!=`),
 `and` / `or`, parentheses, and visit counters (`visited(node_id)`, `visits(node_id) >= 2`).
+
+### Shared menus
+
+A menu written once can ship on every page with `choices_from`, instead of copying the
+list into each file:
+
+```yaml
+# story/_shared/menu.md - frontmatter only, no body needed
+---
+choices:
+    - label: Back to the menu
+      to: menu
+---
+```
+
+```yaml
+# in any node's frontmatter
+choices:
+    - label: Open the secret door
+      to: secret
+choices_from: _shared/menu
+```
+
+The path is relative to `story/`, minus `.md`, and must point at a `_` file; only the
+file's `choices:` list is merged (its other keys are ignored). The node's own choices
+come first, the merged ones follow, and a shared file may chain its own `choices_from`.
+Missing files and duplicate labels across the merged whole are build errors.
+
+## Automatic continuation
+
+`next: node_id` makes a page continue on its own: while the continuation is live no choices are
+offered, and a click (or Space) moves the story to the named node. Pair it with `if:` to make
+it conditional - the condition accepts the same four levels as a choice, and while it is false
+the page falls through to its choices as normal:
+
+```yaml
+next: epilogue
+if: saw_truth
+```
+
+A live `next` wins over choices completely: even a page that lists a full menu shows none of
+it. `end:` nodes never continue - they have no choices and no `next`.
 
 Flags only ever accumulate within a run: they come from the `sets:` of the nodes visited so
 far, so the browser Back button and the save slots restore exactly the flags that were live

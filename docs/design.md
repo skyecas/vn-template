@@ -235,6 +235,7 @@ The gate swings open.
 - Recursion: depth limit + cycle check (`macro_recursion` error)
 - Diagnostics carry the origin chain: `story/_macros/greet.md:2 (via gate.md:12): unknown marker /pv`
 - `choices_from: _shared/menu` merges a file's frontmatter `choices:` (body includes cannot reach frontmatter; this is the shared-menu mechanism)
+- Merge semantics: only the file's `choices:` list is merged (its other frontmatter keys are ignored); the node's own choices come first and the merged choices follow; the merged file may itself carry `choices_from`, which chains with a cycle check; a missing file, a file with no `choices:`, or duplicate labels across the merged whole are build errors (P2's `choices_from_clash` will name the last one)
 
 ### 1.9 Tunnels
 
