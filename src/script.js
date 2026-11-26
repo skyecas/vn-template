@@ -331,7 +331,7 @@ function walkLineList(lines, state, nodeId, visitNumber, onToken) {
 
 // every pov a visible line will name gets its colour assigned once, from the
 // seeded rng, while the node is entered (design 2.3 step 4)
-function assignVisiblePovs(state, node, variant) {
+function assignVisiblePovs(state, node, variant, nodeId) {
     const seen = new Set();
     const consider = pov => {
         if (!pov || seen.has(pov)) return;
@@ -340,8 +340,8 @@ function assignVisiblePovs(state, node, variant) {
     };
     consider(variant.pov);
     consider(variant.messagepov);
-    const visitNumber = state.visits[node.id] || 0; // pre-increment: this visit
-    walkLineList(variant.lines, state, node.id, visitNumber, token => {
+    const visitNumber = state.visits[nodeId] || 0; // pre-increment: this visit
+    walkLineList(variant.lines, state, nodeId, visitNumber, token => {
         if (token.k === "pov" || token.k === "message" || token.k === "messageUnsent") {
             consider(token.v);
         }
@@ -395,7 +395,7 @@ function enterNode(state, nodeId) {
         for (const effect of variant.effects) applyEffect(effect, state);
     }
 
-    assignVisiblePovs(state, node, variant);
+    assignVisiblePovs(state, node, variant, nodeId);
 
     state.visits[nodeId] = (state.visits[nodeId] || 0) + 1;
 }
@@ -1040,7 +1040,7 @@ function collectToken(token, ctx, lineIndex, marks) {
             break;
         }
         case "alt": {
-            const branch = pickAltBranch(token, ctx.state, ctx.node.id, ctx.visitNumber, lineIndex);
+            const branch = pickAltBranch(token, ctx.state, ctx.nodeId, ctx.visitNumber, lineIndex);
             collectTokens(branch, ctx, lineIndex, marks);
             break;
         }
@@ -1146,7 +1146,7 @@ async function renderLineList(entries, ctx) {
     }
 }
 
-async function renderText(nodeContainer, state, node, variant) {
+async function renderText(nodeContainer, state, node, variant, nodeId) {
     const storyPart = document.createElement("div");
     storyPart.className = "story-part";
 
@@ -1180,6 +1180,7 @@ async function renderText(nodeContainer, state, node, variant) {
     const ctx = {
         state,
         node,
+        nodeId,
         storyPart,
         partPace,
         effectPart,
@@ -1187,7 +1188,7 @@ async function renderText(nodeContainer, state, node, variant) {
         partpovcontainer,
         // pre-increment visit number: branch 0 on the first visit, matching
         // the walk assignVisiblePovs did while entering the node
-        visitNumber: Math.max(0, (state.visits[node.id] || 1) - 1),
+        visitNumber: Math.max(0, (state.visits[nodeId] || 1) - 1),
         partmessagepov: variant.messagepov || partpov,
         messageparttitle: variant.messagetitle,
         messagetitle: null,
@@ -1345,7 +1346,7 @@ async function renderNode(state, storyIndex, node) {
     storyContainer.appendChild(nodeContainer);
 
     // create the text
-    await renderText(nodeContainer, state, node, variant);
+    await renderText(nodeContainer, state, node, variant, state.path[storyIndex]);
 
     // create the choices, if they exist
     const isCurrent = storyIndex >= stepStates.length - 1;

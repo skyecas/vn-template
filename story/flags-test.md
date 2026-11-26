@@ -1,6 +1,9 @@
 ---
 revisit: true
 sets: flags-demo-seen
+choices:
+    - label: How do I remove a flag I raised
+      to: clear-test
 choices_from: _shared/menu
 ---
 

@@ -58,6 +58,7 @@ The text of the node goes here.
 | `choices:` | list of choices, see below; empty or missing = dead end |
 | `choices_from:` | path of a `_` file whose `choices:` are appended after this node's own; see Shared menus below |
 | `sets:` | flags raised while this node is on screen, a name or a list of names |
+| `clear:` | flag or var names deleted when this node is entered, a name or a list of names |
 | `vars:` | numeric variables set on entry, a `name: value` map; see Variables below |
 | `next:` | node id to continue to automatically; see Automatic continuation below |
 | `if` (with `next`) | condition for the continuation; when false the page falls through to its choices |
@@ -159,11 +160,11 @@ if: saw_truth
 A live `next` wins over choices completely: even a page that lists a full menu shows none of
 it. `end:` nodes never continue - they have no choices and no `next`.
 
-Flags only ever accumulate within a run: they come from the `sets:` of the nodes visited so
-far, so the browser Back button and the save slots restore exactly the flags that were live
-at that point. The validator warns when a node's choices are *all* gated, because a reader
-missing every flag would have nowhere to go, and when a choice is gated on a flag that
-nothing sets.
+Within a run, flags come from the `sets:` of the nodes visited so far - `clear:` is the one
+way a name comes back down again - so the browser Back button and the save slots restore
+exactly the flags that were live at that point. The validator warns when a node's choices are
+*all* gated, because a reader missing every flag would have nowhere to go, and when a choice
+is gated on a flag that nothing sets.
 
 ## Conditional text
 
@@ -185,6 +186,19 @@ parentheses and visit counters all combine in a single line (`/if score >= 3 and
 Conditions also work mid-sentence, picking a fragment instead of a whole line:
 `you are reading the {has_key: unlocked|locked} branch`.
 
+## Alternate lines
+
+A brace holding branches picks one of them each visit - no flags involved, three spellings:
+
+- `{a|b|c}` - sequence: advances one branch per visit to the node and stops on the last one
+- `{&a|b}` - cycle: walks the branches in order every visit and wraps back to the start
+- `{~a|b|c}` - shuffle: plays one fixed seeded order, so no branch repeats until the order
+  has played out, then the same order starts again
+
+The pick is a pure function of the save state: Back, reloads and shared links all show the
+same branch the first visit produced. The brace can be the whole line or sit mid-sentence,
+where only the picked fragment renders. See `story/alt-test.md`.
+
 ## Variables
 
 `vars:` in the front matter tracks anything that counts - a score, health, gold. A plain number
@@ -199,7 +213,8 @@ vars:
 Write `{name}` anywhere in the text and it is replaced with the current value when the line
 renders (`Your score is {score}`). Variables also drive `if:` on choices and `/if` blocks
 through comparisons (`score >= 3`, with `>`, `>=`, `<`, `<=`, `==`, `!=`). They carry through
-Back, saves and the URL like flags do.
+Back, saves and the URL like flags do. `clear:` in the front matter deletes a name - flag or
+var - the moment its page is entered, before any line or choice is built.
 
 ## Markers
 

@@ -18,6 +18,8 @@ choices:
         any:
           - flags-demo-seen
           - score >= 9999
+    - label: How do I repeat a line in different orders
+      to: alt-test
 choices_from: _shared/menu
 ---
 
