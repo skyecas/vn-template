@@ -1,14 +1,21 @@
+"""v2 compiler: story/*.md -> IR -> validated story.json (version 2).
+
+Pipeline: load + YAML frontmatter (line spans kept) -> lex body lines into
+tokens -> build typed IR -> validate IR (all checks live here) -> emit.
+Design contract: docs/design.md.
+"""
+
 from __future__ import annotations
 
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from json import dumps
 from pathlib import Path
 from typing import Any
 
-from yaml import safe_load
+from yaml import YAMLError, safe_load
 
 SPEEDS = "fastest|faster|fast|slowest|slower|slow"
 PACE_PATTERN = re.compile(rf"/({SPEEDS}|pace \d+\s?(ms|s))", re.IGNORECASE)
@@ -30,16 +37,18 @@ BACKGROUND_COLOUR_PATTERN = re.compile(
 EFFECT_PATTERN = re.compile(r"/(bounce|blink|glow|wave)", re.IGNORECASE)
 META_EFFECT_PATTERN = re.compile(rf"^{EFFECT_PATTERN.pattern[1:]}$", re.IGNORECASE)
 
-POV_PATTERN = re.compile(r"/pov \w+", re.IGNORECASE)
+POV_PATTERN = re.compile(r"/pov (\w+)", re.IGNORECASE)
 META_POV_PATTERN = re.compile(r"^\w+$")
 
 MESSAGE_PATTERN = re.compile(r"/message(-unsent)? \w+", re.IGNORECASE)
+MESSAGE_UNSENT_PATTERN = re.compile(r"/message-unsent \w+", re.IGNORECASE)
+MESSAGE_LINE_PATTERN = re.compile(r"/message \w+", re.IGNORECASE)
 META_MESSAGE_PATTERN = re.compile(r"^\w+$")
 
 MESSAGE_TITLE_PATTERN = re.compile(r"^/message-title ([^/]+)$", re.IGNORECASE)
 META_MESSAGE_TITLE_PATTERN = re.compile(r"^.+$")
 
-PAUSE_PATTERN = re.compile(r"^/pause \d+\s?(ms|s)$", re.IGNORECASE)
+PAUSE_PATTERN = re.compile(r"^/pause \d+\s?(?:ms|s)$", re.IGNORECASE)
 
 BACKGROUND_EFFECTS_PATTERN = re.compile(
     r"^/(" + r"focus (?:\d+(\.\d+)?\%|reset)|effect reset" + ")",
@@ -52,86 +61,714 @@ META_WEATHER_PATTERN = re.compile(rf"^({WEATHER_TYPES})$", re.IGNORECASE)
 
 SFX_PATTERN = re.compile(r"^/sfx ([\w.-]+)$", re.IGNORECASE)
 
-# conditional text blocks: /if <condition> ... [/else] ... /endif
+# line-only structural markers for /if blocks
 IF_PATTERN = re.compile(r"^/if\s+(.+)$", re.IGNORECASE)
 ELSE_PATTERN = re.compile(r"^/else$", re.IGNORECASE)
 ENDIF_PATTERN = re.compile(r"^/endif$", re.IGNORECASE)
-# strips a whole conditional marker so unknown_markers does not flag it
-CONDITIONAL_STRIP_PATTERN = re.compile(r"^/(?:if\s+.+|else|endif)$", re.IGNORECASE)
-
-# a condition is either a (possibly negated) flag name, or a numeric
-# comparison against a variable: score >= 10
-COMPARE_OPERATORS = r">=|<=|==|!=|>|<"
-CONDITION_COMPARE_PATTERN = re.compile(
-    rf"^(.+?)\s*({COMPARE_OPERATORS})\s*(-?\d+(?:\.\d+)?)$"
-)
-CONDITION_FLAG_PATTERN = re.compile(r"^(?:not\s+)?([^<>=]+)$")
 
 # values that mean "turn it off" rather than naming a file
 CLEAR_VALUES = {"none", "reset", "clear"}
 
+# frontmatter keys, per docs/design.md 1.2/1.3; keys outside these lists are
+# the unknown_keys build error. P1/P2 features add theirs when they land.
+NODE_KEYS = {
+    "start",
+    "end",
+    "revisit",
+    "title",
+    "chapter",
+    "sets",
+    "clear",
+    "vars",
+    "next",
+    "if",
+    "pace",
+    "colour",
+    "effect",
+    "pov",
+    "message-pov",
+    "message-title",
+    "background",
+    "weather",
+    "image",
+    "music",
+    "choices",
+}
+CHOICE_KEYS = {"label", "to", "if"}
 
-def debug(part: StoryPart | None = None, msg: str = ""):
+
+def debug(msg: str) -> None:
     if DEBUG:
-        if part:
-            print(f" - {part.pathname}: {msg}")
-        else:
-            print(f" - {msg}")
+        print(f" - {msg}")
 
 
-def condition_is_var(condition: str) -> bool:
-    """a numeric comparison rather than a plain flag check"""
-    inner = re.sub(r"^not\s+", "", condition.strip(), flags=re.IGNORECASE)
-    return bool(CONDITION_COMPARE_PATTERN.match(inner))
+# ---------------------------------------------------------------------------
+# condition grammar (design 1.4): one parser, four levels, AST out
+# ---------------------------------------------------------------------------
 
 
-def condition_reference(condition: str) -> str:
-    """the flag or variable name a condition reads"""
-    inner = re.sub(r"^not\s+", "", condition.strip(), flags=re.IGNORECASE)
-    match = CONDITION_COMPARE_PATTERN.match(inner)
-    return match.group(1).strip() if match else inner.strip()
+class CondError(ValueError):
+    """a condition string that does not parse"""
 
 
-def condition_error(condition: str) -> str | None:
-    """None when the condition parses, else a message explaining why not"""
-    if CONDITION_COMPARE_PATTERN.match(condition.strip()):
+_COND_TOKEN = re.compile(
+    r"""\s*(?:
+        (?P<lparen>\()
+      | (?P<rparen>\))
+      | (?P<cmp>==|!=|>=|<=|>|<)
+      | (?P<str>"[^"]*"|'[^']*')
+      | (?P<num>-?\d+(?:\.\d+)?)
+      | (?P<ident>[A-Za-z_][\w-]*)
+    )""",
+    re.VERBOSE,
+)
+_CMP_TOKEN = re.compile(r"^(>=|<=|==|!=|>|<)$")
+
+
+def _cond_tokens(text: str) -> list[tuple[str, str]]:
+    tokens: list[tuple[str, str]] = []
+    pos = 0
+    while pos < len(text):
+        match = _COND_TOKEN.match(text, pos)
+        if not match:
+            if text[pos:].strip() == "":
+                break
+            raise CondError(f"unexpected token {text[pos:]!r} in {text!r}")
+        pos = match.end()
+        kind = match.lastgroup or ""
+        value = match.group(kind)
+        if kind == "ident" and value.lower() in {"and", "or", "not"}:
+            kind = value.lower()
+        tokens.append((kind, value))
+    return tokens
+
+
+class _CondParser:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.tokens = _cond_tokens(text)
+        self.pos = 0
+
+    def peek(self) -> tuple[str, str] | None:
+        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+
+    def take(self) -> tuple[str, str]:
+        token = self.peek()
+        if token is None:
+            raise CondError(f"unexpected end of condition {self.text!r}")
+        self.pos += 1
+        return token
+
+    def expect(self, kind: str) -> str:
+        token = self.take()
+        if token[0] != kind:
+            raise CondError(f"expected {kind}, got {token[1]!r} in {self.text!r}")
+        return token[1]
+
+    def parse(self) -> dict:
+        if not self.tokens:
+            raise CondError("empty condition")
+        ast = self.parse_or()
+        if (rest := self.peek()) is not None:
+            raise CondError(f"trailing {rest[1]!r} in {self.text!r}")
+        return ast
+
+    def parse_or(self) -> dict:
+        args = [self.parse_and()]
+        while (token := self.peek()) and token[0] == "or":
+            self.take()
+            args.append(self.parse_and())
+        return args[0] if len(args) == 1 else {"op": "or", "args": args}
+
+    def parse_and(self) -> dict:
+        args = [self.parse_not()]
+        while (token := self.peek()) and token[0] == "and":
+            self.take()
+            args.append(self.parse_not())
+        return args[0] if len(args) == 1 else {"op": "and", "args": args}
+
+    def parse_not(self) -> dict:
+        if (token := self.peek()) and token[0] == "not":
+            self.take()
+            return {"op": "not", "arg": self.parse_not()}
+        return self.parse_primary()
+
+    def parse_primary(self) -> dict:
+        token = self.peek()
+        if token is None:
+            raise CondError(f"unexpected end of condition {self.text!r}")
+        if token[0] == "lparen":
+            self.take()
+            ast = self.parse_or()
+            self.expect("rparen")
+            return ast
+        if token[0] in {"num", "str"} or (
+            token[0] == "ident" and token[1] in {"visited", "visits"}
+        ):
+            return self.parse_comparison_or_truth()
+        if token[0] == "ident":
+            return self.parse_comparison_or_truth()
+        raise CondError(f"unexpected {token[1]!r} in {self.text!r}")
+
+    def parse_comparison_or_truth(self) -> dict:
+        lhs = self.parse_term()
+        token = self.peek()
+        if token and token[0] == "cmp":
+            op = self.take()[1]
+            rhs = self.parse_term()
+            return {"op": "cmp", "lhs": lhs, "cmp": op, "rhs": rhs}
+        # a bare name is a truthiness check; everything else needs a comparison
+        if isinstance(lhs, str):
+            return {"op": "truth", "name": lhs}
+        raise CondError(f"{self.text!r} needs a comparison operator")
+
+    def parse_term(self) -> Any:
+        kind, value = self.take()
+        if kind == "num":
+            return float(value) if "." in value else int(value)
+        if kind == "str":
+            return {"str": value[1:-1]}
+        if kind == "ident" and value in {"visited", "visits"}:
+            self.expect("lparen")
+            name = self.expect("ident")
+            self.expect("rparen")
+            visits: dict = {"op": "visits", "id": name}
+            if value == "visited":
+                return {"op": "cmp", "lhs": visits, "cmp": ">=", "rhs": 1}
+            return visits
+        if kind == "ident":
+            return value
+        raise CondError(f"unexpected {value!r} in {self.text!r}")
+
+
+def parse_condition_str(text: str) -> dict:
+    """level 4: one full expression -> CondAST (design 1.4)"""
+    return _CondParser(text).parse()
+
+
+def _cond_and(args: list[dict]) -> dict:
+    if len(args) == 1:
+        return args[0]
+    return {"op": "and", "args": args}
+
+
+def parse_condition(raw: Any) -> dict | None:
+    """all four frontmatter levels; None means "no condition"."""
+    if raw is None:
         return None
-    if CONDITION_FLAG_PATTERN.match(condition.strip()):
-        return None
-    return f"cannot parse condition {condition!r}"
+    if isinstance(raw, str):
+        if not raw.strip():
+            return None
+        try:
+            return parse_condition_str(raw)
+        except CondError as e:
+            return {"op": "bad", "raw": raw, "why": str(e)}
+    if isinstance(raw, list):
+        if not raw:
+            return None
+        args = []
+        for entry in raw:
+            if not isinstance(entry, str):
+                return {
+                    "op": "bad",
+                    "raw": repr(entry),
+                    "why": "level 1/2 entries must be strings",
+                }
+            try:
+                args.append(parse_condition_str(entry))
+            except CondError as e:
+                return {"op": "bad", "raw": entry, "why": str(e)}
+        return _cond_and(args)
+    if isinstance(raw, dict):
+        return parse_condition_map(raw)
+    return {
+        "op": "bad",
+        "raw": repr(raw),
+        "why": "condition must be a string, list or group map",
+    }
 
 
-def part_conditions(part: StoryPart) -> list[str]:
-    """every condition a part reads: choice gates plus /if markers in text"""
-    conditions = [c for choice in part.choices for c in choice.condition]
-    for line in part.text.splitlines():
-        match = IF_PATTERN.match(line.strip())
-        if match:
-            conditions.append(match.group(1))
-    return conditions
+_LEVEL3_KEY = re.compile(
+    r"^(all|any|none)$|^(at_least|at_most|exactly) (\d+)$|^between (\d+) and (\d+)$"
+)
+
+
+def parse_condition_map(raw: dict) -> dict:
+    """level 3: structured count groups, all groups ANDed (design 1.4)"""
+    if not raw:
+        return {"op": "bad", "raw": "{}", "why": "empty condition map"}
+    groups = []
+    for key, entries in raw.items():
+        if not isinstance(key, str) or not _LEVEL3_KEY.match(key):
+            return {
+                "op": "bad",
+                "raw": repr(key),
+                "why": f"unknown group {key!r} (level 4 string for deeper structure)",
+            }
+        if not isinstance(entries, list) or not entries:
+            return {
+                "op": "bad",
+                "raw": repr(key),
+                "why": f"group {key!r} needs a list of expressions",
+            }
+        args = []
+        for entry in entries:
+            if not isinstance(entry, str):
+                return {
+                    "op": "bad",
+                    "raw": repr(entry),
+                    "why": "no nesting inside groups; use a level 4 string",
+                }
+            try:
+                args.append(parse_condition_str(entry))
+            except CondError as e:
+                return {"op": "bad", "raw": entry, "why": str(e)}
+        bound = _LEVEL3_KEY.match(key)
+        if bound.group(1) == "all":
+            minimum, maximum = len(args), len(args)
+        elif bound.group(1) == "any":
+            minimum, maximum = 1, None
+        elif bound.group(1) == "none":
+            minimum, maximum = 0, 0
+        elif bound.group(2) == "at_least":
+            minimum, maximum = int(bound.group(3)), None
+        elif bound.group(2) == "at_most":
+            minimum, maximum = 0, int(bound.group(3))
+        elif bound.group(2) == "exactly":
+            minimum = maximum = int(bound.group(3))
+        else:  # between N and M
+            minimum, maximum = int(bound.group(4)), int(bound.group(5))
+        groups.append({"op": "count", "min": minimum, "max": maximum, "args": args})
+    return _cond_and(groups)
+
+
+def walk_cond(cond: dict | None) -> dict:
+    """yield every cond node in an AST (for checks)"""
+    if not cond:
+        return
+    yield cond
+    for key in ("args", "arg"):
+        child = cond.get(key)
+        if isinstance(child, dict):
+            yield from walk_cond(child)
+        elif isinstance(child, list):
+            for item in child:
+                if isinstance(item, dict):
+                    yield from walk_cond(item)
+
+
+def cond_names(cond: dict | None) -> set[str]:
+    """every variable name a condition reads"""
+    names: set[str] = set()
+    for node in walk_cond(cond):
+        op = node.get("op")
+        if op in {"truth"}:
+            names.add(node.get("name", ""))
+        elif op == "visits":
+            names.add(node.get("id", ""))
+        elif op == "cmp":
+            for side in (node.get("lhs"), node.get("rhs")):
+                if isinstance(side, str):
+                    names.add(side)
+                elif isinstance(side, dict) and side.get("op") == "visits":
+                    names.add(side.get("id", ""))
+    return names - {""}
+
+
+def cond_is_comparison(cond: dict | None) -> bool:
+    """whether a condition reads names through comparisons (vs truth checks)"""
+    for node in walk_cond(cond):
+        if node.get("op") == "cmp":
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# effect grammar (design 1.5): one parser, three spellings
+# ---------------------------------------------------------------------------
+
+_EFFECT_CLEAR = re.compile(r"^clear\s+([\w-]+)$")
+_EFFECT_ROLL = re.compile(r"^roll\s+([\w-]+)\s+(\d+)d(\d+)([+-]\d+)?$")
+_EFFECT_UNLOCK = re.compile(r"^unlock\s+([\w-]+)$")
+_EFFECT_ASSIGN = re.compile(r"^([\w-]+)\s*=\s*(.+)$")
+_EFFECT_ADD = re.compile(r"^([\w-]+)\s*([+-]\s*\d+(?:\.\d+)?)$")
+_EFFECT_SET = re.compile(r"^([\w-]+)$")
+
+
+class EffectError(ValueError):
+    """an effect string that does not parse"""
+
+
+def parse_effect(text: str) -> dict:
+    raw = text.strip()
+    if match := _EFFECT_CLEAR.match(raw):
+        return {"op": "clear", "name": match.group(1)}
+    if match := _EFFECT_ROLL.match(raw):
+        dice = [int(match.group(2)), int(match.group(3)), int(match.group(4) or 0)]
+        return {"op": "roll", "var": match.group(1), "dice": dice}
+    if match := _EFFECT_UNLOCK.match(raw):
+        return {"op": "unlock", "id": match.group(1)}
+    if match := _EFFECT_ASSIGN.match(raw):
+        return {
+            "op": "assign",
+            "name": match.group(1),
+            "val": _effect_value(match.group(2)),
+        }
+    if match := _EFFECT_ADD.match(raw):
+        return {
+            "op": "add",
+            "name": match.group(1),
+            "val": float(match.group(2).replace(" ", "")),
+        }
+    if match := _EFFECT_SET.match(raw):
+        return {"op": "set", "name": match.group(1)}
+    raise EffectError(f"cannot parse effect {text!r}")
+
+
+def _effect_value(text: str) -> Any:
+    value = text.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    try:
+        number = float(value)
+        return int(number) if number.is_integer() else number
+    except ValueError:
+        return value
+
+
+# ---------------------------------------------------------------------------
+# token lexer: body lines -> token lines (design 1.6 / 2.1)
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class StoryParts:
-    variants: list[StoryPart]
+class LexResult:
+    lines: list[list[dict]]
+    block_error: str | None = None
+
+
+def _mk(kind: str, value: str) -> dict:
+    return {"t": "mk", "k": kind, "v": value}
+
+
+def _find_spans(
+    text: str, pattern: re.Pattern[str], kind: str, group: int | None = None
+) -> list[tuple[int, int, dict]]:
+    spans = []
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        value = match.group(group) if group is not None else match.group(0).lstrip("/")
+        spans.append((start, end, _mk(kind, value)))
+    return spans
+
+
+def lex_content(text: str) -> list[dict]:
+    """split a line's text into lit / var / if / alt tokens (design 1.6)"""
+    tokens: list[dict] = []
+    pos = 0
+    while True:
+        open_at = text.find("{", pos)
+        if open_at == -1:
+            break
+        close_at = text.find("}", open_at + 1)
+        if close_at == -1:
+            break
+        inner = text[open_at + 1 : close_at]
+        parsed = _lex_brace(inner)
+        if parsed is None:
+            # not a construct we know: literal braces, keep scanning past them
+            pos = open_at + 1
+            continue
+        if text[pos:open_at]:
+            tokens.append({"t": "lit", "v": text[pos:open_at]})
+        tokens.append(parsed)
+        pos = close_at + 1
+    if text[pos:]:
+        tokens.append({"t": "lit", "v": text[pos:]})
+    return tokens
+
+
+def _lex_brace(inner: str) -> dict | None:
+    """{name} var, {cond: a|b} inline if, {a|b} seq, {&a|b} cycle, {~a|b} shuffle"""
+    if not inner:
+        return None
+    if re.fullmatch(r"\w+", inner):
+        return {"t": "var", "name": inner}
+    if inner[0] in {"&", "~"}:
+        mode = "cycle" if inner[0] == "&" else "shuffle"
+        branches = inner[1:].split("|")
+        if len(branches) < 2:
+            return None
+        return {
+            "t": "alt",
+            "mode": mode,
+            "branches": [[lex_content(b)] for b in branches],
+        }
+    colon = inner.find(":")
+    pipe = inner.find("|")
+    if colon != -1 and pipe != -1 and colon < pipe:
+        # inline if: colon before a pipe (design 1.6)
+        head, tail = inner[:colon], inner[colon + 1 :]
+        branches = tail.split("|")
+        try:
+            cond = parse_condition_str(head)
+            if len(branches) > 2:
+                cond = {
+                    "op": "bad",
+                    "raw": head,
+                    "why": "inline if takes at most then|else",
+                }
+        except CondError as e:
+            cond = {"op": "bad", "raw": head, "why": str(e)}
+        then = [lex_content(branches[0])] if branches[0] else []
+        els = [lex_content(branches[1])] if len(branches) > 1 and branches[1] else []
+        return {"t": "if", "cond": cond, "then": then, "else": els}
+    if "|" in inner:
+        branches = inner.split("|")
+        if len(branches) >= 2:
+            return {
+                "t": "alt",
+                "mode": "seq",
+                "branches": [[lex_content(b)] for b in branches],
+            }
+    return None
+
+
+def lex_line(text: str) -> list[dict] | None:
+    """one source line -> tokens; None for an empty line"""
+    stripped = text.strip()
+    if not stripped:
+        return None
+
+    # exclusive line markers (design 1.6): the whole line is the marker
+    if match := PAUSE_PATTERN.match(stripped):
+        return [_mk("pause", match.group(0)[1:].split(" ", 1)[1])]
+    if match := BACKGROUND_EFFECTS_PATTERN.match(stripped):
+        body = match.group(0)[1:]
+        return [
+            _mk(
+                "focus" if body.lower().startswith("focus") else "effectReset",
+                body.split(" ", 1)[1],
+            )
+        ]
+    if match := BACKGROUND_COLOUR_PATTERN.match(stripped):
+        return [_mk("background", match.group(1))]
+    if match := WEATHER_PATTERN.match(stripped):
+        return [_mk("weather", match.group(1))]
+    if match := SFX_PATTERN.match(stripped):
+        return [_mk("sfx", match.group(1))]
+    if match := MESSAGE_TITLE_PATTERN.match(stripped):
+        return [_mk("messageTitle", match.group(1))]
+
+    # text lines: known markers anywhere (placement is the checks' business)
+    spans: list[tuple[int, int, dict]] = []
+    spans += _find_spans(stripped, COLOUR_PATTERN, "colour")
+    spans += _find_spans(stripped, PACE_PATTERN, "pace")
+    spans += _find_spans(stripped, EFFECT_PATTERN, "effect")
+    spans += _find_spans(stripped, POV_PATTERN, "pov", group=1)
+    spans += _find_spans(stripped, MESSAGE_UNSENT_PATTERN, "messageUnsent", group=0)
+    spans += _find_spans(stripped, MESSAGE_LINE_PATTERN, "message", group=0)
+    spans.sort(key=lambda span: span[0])
+
+    # drop overlapping spans (later categories win only if they start later
+    # and do not overlap an accepted span; the categories do not overlap)
+    accepted: list[tuple[int, int, dict]] = []
+    cursor = -1
+    for span in spans:
+        if span[0] >= cursor:
+            accepted.append(span)
+            cursor = span[1]
+
+    tokens: list[dict] = []
+    cursor = 0
+    for start, end, token in accepted:
+        if start > cursor:
+            tokens += lex_content(stripped[cursor:start])
+        # markers keep the shape the renderer expects (value minus leading /)
+        if token["k"] in {"message", "messageUnsent"}:
+            token["v"] = token["v"].split(" ", 1)[1]
+        tokens.append(token)
+        cursor = end
+    if cursor < len(stripped):
+        tokens += lex_content(stripped[cursor:])
+    return tokens or None
+
+
+def lex_body(body_lines: list[tuple[int, str]]) -> LexResult:
+    """whole body: /if blocks nest into if tokens, everything else in order"""
+    lines: list[list[dict]] = []
+    stack: list[dict] = []
+    error: str | None = None
+
+    def current() -> list[list[dict]]:
+        return (
+            stack[-1]["else"]
+            if stack and stack[-1]["seen_else"]
+            else (stack[-1]["then"] if stack else lines)
+        )
+
+    for line_no, raw in body_lines:
+        stripped = raw.strip()
+        if match := IF_PATTERN.match(stripped):
+            try:
+                cond = parse_condition_str(match.group(1))
+            except CondError as e:
+                cond = {"op": "bad", "raw": match.group(1), "why": str(e)}
+            stack.append(
+                {
+                    "cond": cond,
+                    "then": [],
+                    "else": [],
+                    "seen_else": False,
+                    "line": line_no,
+                }
+            )
+            continue
+        if ELSE_PATTERN.match(stripped):
+            if not stack:
+                error = error or f"/else on line {line_no} with no open /if"
+            elif stack[-1]["seen_else"]:
+                error = error or f"second /else on line {line_no}"
+            else:
+                stack[-1]["seen_else"] = True
+            continue
+        if ENDIF_PATTERN.match(stripped):
+            if not stack:
+                error = error or f"/endif on line {line_no} with no open /if"
+            else:
+                frame = stack.pop()
+                token = {
+                    "t": "if",
+                    "cond": frame["cond"],
+                    "then": frame["then"],
+                    "else": frame["else"],
+                }
+                current().append([token])
+            continue
+        tokens = lex_line(raw)
+        if tokens:
+            current().append(tokens)
+
+    while stack:
+        error = error or "an /if is never closed with /endif"
+        frame = stack.pop()
+        token = {
+            "t": "if",
+            "cond": frame["cond"],
+            "then": frame["then"],
+            "else": frame["else"],
+        }
+        current().append([token])
+    return LexResult(lines=lines, block_error=error)
+
+
+# ---------------------------------------------------------------------------
+# IR (design 3.2): every IR node carries (file, line)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ChoiceIR:
+    label: str
+    target: str
+    file: Path
+    line: int = 1
+    cond: dict | None = None
+    effects: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class VariantIR:
+    """one story file; the unit every check reports on"""
+
+    filepath: Path
+    pathname: str
+    line: int
+    src: list[tuple[int, str]]  # raw body lines, for the regex-based checks
+    lines: list[list[dict]] = field(default_factory=list)  # lexed token lines
+    block_error: str | None = None
+    choices: list[ChoiceIR] = field(default_factory=list)
+    effects: list[dict] = field(default_factory=list)
+    unknown_keys: list[str] = field(default_factory=list)
+    revisit: bool = True
+    pace: str | None = None
+    colour: str | None = None
+    effect: str | None = None
+    pov: str | None = None
+    messagepov: str | None = None
+    messagetitle: str | None = None
+    background: str | None = None
+    weather: str | None = None
+    image: str | None = None
+    music: str | None = None
+
+    @property
+    def text(self) -> str:
+        """the raw body, exactly what the old regex checks walked"""
+        return "\n".join(text for _, text in self.src)
+
+
+@dataclass
+class NodeIR:
+    id: str
+    filepath: Path
+    line: int = 1
+    variants: list[VariantIR] = field(default_factory=list)
     is_start: bool = False
     is_end: bool = False
+    title: str | None = None
+    chapter: str | None = None
+    next: str | None = None
+    next_if: dict | None = None
 
     @property
     def revisit(self) -> bool:
         return all(variant.revisit for variant in self.variants)
 
 
-@dataclass
-class Choice:
-    label: str
-    target: str
-    # flags that must already be set for this choice to appear
-    condition: list[str] = field(default_factory=list)
+# frontmatter key -> emitted variant attribute (v1 names kept for the renderer)
+PRESENTATION_KEYS = {
+    "pace": "pace",
+    "colour": "colour",
+    "effect": "effect",
+    "pov": "pov",
+    "message-pov": "messagepov",
+    "message-title": "messagetitle",
+    "background": "background",
+    "weather": "weather",
+    "image": "image",
+    "music": "music",
+}
 
 
-def parse_choices(raw: Any, part: StoryPart | None = None) -> list[Choice]:
-    """choices is a list of {label, to, if} entries."""
+def parse_markdown(content: str) -> tuple[dict[str, Any], str]:
+    content = content.strip()
+    if not content.startswith("---"):
+        return {}, content
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        raise ValueError("unterminated frontmatter, missing the closing '---'")
+    _, meta, body = parts
+    try:
+        loaded = safe_load(meta)
+    except YAMLError as e:
+        # meta keeps the file's line numbering (its first line is the blank
+        # after the opening ---), so the mark points at the real line
+        mark = getattr(e, "problem_mark", None)
+        where = (
+            f"line {mark.line + 1}, column {mark.column + 1}"
+            if mark
+            else "unknown line"
+        )
+        problem = getattr(e, "problem", None) or str(e)
+        raise ValueError(f"frontmatter {where}: {problem}") from e
+    return loaded or {}, body.strip().replace("\\", "/")
+
+
+def parse_choices(raw: Any, filepath: Path, unknown: list[str]) -> list[ChoiceIR]:
+    """choices is a list of {label, to, if} entries (design 1.3)"""
     if raw is None:
         return []
     if not isinstance(raw, list):
@@ -149,18 +786,18 @@ def parse_choices(raw: Any, part: StoryPart | None = None) -> list[Choice]:
         target = entry.get("to")
         if not label or not target:
             raise ValueError(f"choice {i + 1} needs both a label and a to")
+        for key in entry:
+            if key not in CHOICE_KEYS:
+                unknown.append(f"choice {i + 1} key {key!r}")
 
-        condition = entry.get("if") or []
-        if isinstance(condition, str):
-            condition = [condition]
-        if not isinstance(condition, list) or not all(
-            isinstance(flag, str) for flag in condition
-        ):
-            raise ValueError(
-                f"choice {i + 1}: if must be a flag name or list of flag names"
+        choices.append(
+            ChoiceIR(
+                label=str(label),
+                target=str(target),
+                file=filepath,
+                cond=parse_condition(entry.get("if")),
             )
-
-        choices.append(Choice(str(label), str(target), condition))
+        )
 
     labels = [choice.label for choice in choices]
     if len(labels) != len(set(labels)):
@@ -169,128 +806,196 @@ def parse_choices(raw: Any, part: StoryPart | None = None) -> list[Choice]:
     return choices
 
 
-@dataclass
-class StoryPart:
-    text: str
-    filepath: Path
-    pathname: str
-    pace: str | None
-    colour: str | None
-    effect: str | None
-    pov: str | None
-    messagepov: str | None
-    messagetitle: str | None
-    background: str | None
-    weather: str | None
-    revisit: bool = True
-    choices: list[Choice] = field(default_factory=list)
-    # flags raised while this part is on screen
-    sets: list[str] = field(default_factory=list)
-    # numeric variables while this part is on screen: name -> number or "+n"/"-n"
-    vars: dict[str, Any] = field(default_factory=dict)
-    # background image file under src/images/
-    image: str | None = None
-    # looping track file under src/audio/
-    music: str | None = None
+def parse_front_effects(metadata: dict[str, Any], filepath: Path) -> list[dict]:
+    """sets/clear/vars frontmatter -> one effects list (design 1.2/1.5)"""
+    effects: list[dict] = []
+
+    raw_sets = metadata.get("sets") or []
+    if isinstance(raw_sets, str):
+        raw_sets = [raw_sets]
+    if not isinstance(raw_sets, list) or not all(
+        isinstance(flag, str) for flag in raw_sets
+    ):
+        raise ValueError(f"{filepath}: sets must be a name or list of names")
+    for name in raw_sets:
+        try:
+            effects.append(parse_effect(name))
+        except EffectError as e:
+            raise ValueError(f"{filepath}: sets: {e}") from e
+
+    raw_clear = metadata.get("clear") or []
+    if isinstance(raw_clear, str):
+        raw_clear = [raw_clear]
+    if not isinstance(raw_clear, list) or not all(
+        isinstance(flag, str) for flag in raw_clear
+    ):
+        raise ValueError(f"{filepath}: clear must be a name or list of names")
+    for name in raw_clear:
+        try:
+            effects.append(parse_effect(f"clear {name}"))
+        except EffectError as e:
+            raise ValueError(f"{filepath}: clear: {e}") from e
+
+    raw_vars = metadata.get("vars") or {}
+    if not isinstance(raw_vars, dict) or not all(isinstance(k, str) for k in raw_vars):
+        raise ValueError(f"{filepath}: vars must be a mapping of name: value")
+    for vname, vvalue in raw_vars.items():
+        if isinstance(vvalue, bool) or not isinstance(vvalue, (int, float, str)):
+            raise TypeError(
+                f"{filepath}: vars.{vname} must be a number, a string "
+                f'or a "+n"/"-n" string'
+            )
+        if isinstance(vvalue, (int, float)):
+            effects.append({"op": "assign", "name": vname, "val": vvalue})
+        elif re.fullmatch(r"[+-]\s*\d+(?:\.\d+)?", vvalue.strip()):
+            val = float(vvalue.replace(" ", ""))
+            effects.append(
+                {
+                    "op": "add",
+                    "name": vname,
+                    "val": int(val) if val.is_integer() else val,
+                }
+            )
+        else:
+            effects.append({"op": "assign", "name": vname, "val": vvalue})
+    return effects
 
 
-def parse_markdown(content: str) -> tuple[dict[str, Any], str]:
-    content = content.strip()
-    if not content.startswith("---"):
-        return {}, content
-    parts = content.split("---", 2)
-    if len(parts) < 3:
-        raise ValueError("unterminated frontmatter, missing the closing '---'")
-    _, meta, body = parts
-    return safe_load(meta), body.strip().replace("\\", "/")
-
-
-def find_parts() -> dict[str, StoryParts]:
-    parts: dict[str, StoryParts] = {}
+def find_parts() -> dict[str, NodeIR]:
+    parts: dict[str, NodeIR] = {}
     base = Path("story")
     for f in base.glob("**/*.md"):
-        has_variants = len(f.parts) > 2
-
-        pathname = f.parts[-2] if has_variants else f.stem
+        rel = f.relative_to(base)
+        if any(name.startswith("_") for name in rel.parts):
+            continue  # shared macro/include files are not nodes (design 1.1)
+        pathname = rel.parts[-2] if len(rel.parts) > 1 else f.stem
 
         try:
             metadata, body = parse_markdown(f.read_text("utf-8"))
         except ValueError as e:
             raise ValueError(f"{f}: {e}") from e
+
+        unknown = [f"node key {key!r}" for key in metadata if key not in NODE_KEYS]
         try:
-            choices = parse_choices(metadata.get("choices"))
+            choices = parse_choices(metadata.get("choices"), f, unknown)
+            effects = parse_front_effects(metadata, f)
         except (ValueError, TypeError) as e:
             raise ValueError(f"{f}: {e}") from e
 
-        raw_sets = metadata.get("sets") or []
-        if isinstance(raw_sets, str):
-            raw_sets = [raw_sets]
-        if not isinstance(raw_sets, list) or not all(
-            isinstance(flag, str) for flag in raw_sets
-        ):
-            raise ValueError(f"{f}: sets must be a flag name or list of flag names")
-
-        raw_vars = metadata.get("vars") or {}
-        if not isinstance(raw_vars, dict) or not all(
-            isinstance(k, str) for k in raw_vars
-        ):
-            raise ValueError(f"{f}: vars must be a mapping of name: value")
-        for vname, vvalue in raw_vars.items():
-            is_number = isinstance(vvalue, (int, float)) and not isinstance(
-                vvalue, bool
-            )
-            is_delta = (
-                isinstance(vvalue, str)
-                and re.fullmatch(r"[+-]\d+(?:\.\d+)?", vvalue.strip()) is not None
-            )
-            if not (is_number or is_delta):
-                raise ValueError(
-                    f'{f}: vars.{vname} must be a number or a "+n"/"-n" string'
-                )
-
-        this_part = StoryPart(
-            choices=choices,
-            sets=raw_sets,
-            vars=raw_vars,
-            text=body,
+        body_lines = list(enumerate(body.splitlines(), 1))
+        lexed = lex_body(body_lines)
+        variant = VariantIR(
             filepath=f,
             pathname=pathname,
-            pace=metadata.get("pace"),
-            colour=metadata.get("colour"),
-            effect=metadata.get("effect"),
-            pov=metadata.get("pov"),
-            revisit=metadata.get("revisit", True),
-            messagepov=metadata.get("message-pov"),
-            messagetitle=metadata.get("message-title"),
-            background=metadata.get("background"),
-            weather=metadata.get("weather"),
-            image=metadata.get("image"),
-            music=metadata.get("music"),
+            line=1,
+            src=body_lines,
+            lines=lexed.lines,
+            block_error=lexed.block_error,
+            choices=choices,
+            effects=effects,
+            unknown_keys=unknown,
+            revisit=bool(metadata.get("revisit", True)),
         )
+        for key, attr in PRESENTATION_KEYS.items():
+            setattr(variant, attr, metadata.get(key))
 
-        if pathname not in parts:
-            parts[pathname] = StoryParts(variants=[this_part])
-        else:
-            parts[pathname].variants.append(this_part)
-
-        # any variant can mark the part as a start or an end point
-        parts[pathname].is_start = parts[pathname].is_start or metadata.get(
-            "start", False
-        )
-        parts[pathname].is_end = parts[pathname].is_end or metadata.get("end", False)
-        debug(msg=f"added {f.name} to {pathname}")
+        node = parts.get(pathname)
+        if node is None:
+            node = NodeIR(id=pathname, filepath=f)
+            parts[pathname] = node
+        node.variants.append(variant)
+        node.is_start = node.is_start or bool(metadata.get("start", False))
+        node.is_end = node.is_end or bool(metadata.get("end", False))
+        if node.title is None and metadata.get("title"):
+            node.title = str(metadata["title"])
+        if node.chapter is None and metadata.get("chapter"):
+            node.chapter = str(metadata["chapter"])
+        if node.next is None and metadata.get("next"):
+            node.next = str(metadata["next"])
+        if node.next_if is None and metadata.get("if") is not None:
+            node.next_if = parse_condition(metadata.get("if"))
+        debug(f"added {f.name} to {pathname}")
 
     return parts
 
 
-def all_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
+# ---------------------------------------------------------------------------
+# condition gathering for checks: walk token lines for every cond AST
+# ---------------------------------------------------------------------------
+
+
+def iter_conds(lines: list) -> Iterator[dict]:
+    """every cond in a token line-list: block ifs, inline ifs, alt branches"""
+    for line in lines:
+        for token in line:
+            if token["t"] == "if":
+                yield token["cond"]
+                yield from iter_conds(token["then"])
+                yield from iter_conds(token["else"])
+            elif token["t"] == "alt":
+                for branch in token["branches"]:
+                    yield from iter_conds(branch)
+
+
+def variant_conds(variant: VariantIR) -> Iterator[dict]:
+    """every cond a variant reads: choice gates plus /if and {cond:} sites"""
+    for choice in variant.choices:
+        if choice.cond:
+            yield choice.cond
+    yield from iter_conds(variant.lines)
+
+
+def _effect_writes(parts: dict[str, NodeIR]) -> set[str]:
+    """every name any effect writes (design: flags and vars unified)"""
+    names: set[str] = set()
+    for path in parts.values():
+        for part in path.variants:
+            for effect in [
+                *part.effects,
+                *(e for c in part.choices for e in c.effects),
+            ]:
+                if "name" in effect:
+                    names.add(effect["name"])
+                elif effect.get("op") == "roll":
+                    names.add(effect["var"])
+    return names
+
+
+def _truth_reads(cond: dict | None) -> set[str]:
+    """names read for truthiness (the old unknown_flags domain)"""
+    return {
+        node.get("name", "") for node in walk_cond(cond) if node.get("op") == "truth"
+    } - {""}
+
+
+def _cmp_reads(cond: dict | None) -> set[str]:
+    """names read through comparisons (the old unknown_vars domain)"""
+    names: set[str] = set()
+    for node in walk_cond(cond):
+        if node.get("op") != "cmp":
+            continue
+        for side in (node.get("lhs"), node.get("rhs")):
+            if isinstance(side, str):
+                names.add(side)
+    return names
+
+
+# ---------------------------------------------------------------------------
+# checks (design 4.1): 44 migrated + unknown_keys + count_range = 46
+# ---------------------------------------------------------------------------
+
+# strips a whole conditional marker so unknown_markers does not flag it
+CONDITIONAL_STRIP_PATTERN = re.compile(r"^/(?:if\s+.+|else|endif)$", re.IGNORECASE)
+
+
+def all_nodes(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
     for path in parts.values():
         nodes.extend(path.variants)
     return nodes
 
 
-def starting_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def starting_nodes(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
     for path in parts.values():
         if path.is_start:
@@ -298,7 +1003,7 @@ def starting_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
     return nodes
 
 
-def ending_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def ending_nodes(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
     for path in parts.values():
         if path.is_end:
@@ -306,7 +1011,7 @@ def ending_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
     return nodes
 
 
-def start_end_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def start_end_nodes(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
     for path in parts.values():
         if path.is_end and path.is_start:
@@ -314,7 +1019,7 @@ def start_end_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
     return nodes
 
 
-def empty_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def empty_nodes(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
     for path in parts.values():
         for part in path.variants:
@@ -323,7 +1028,7 @@ def empty_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
     return nodes
 
 
-def duplicate_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def duplicate_nodes(parts: dict[str, NodeIR]) -> list[VariantIR]:
     text = []
     nodes = []
     for path in parts.values():
@@ -335,122 +1040,118 @@ def duplicate_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
     return nodes
 
 
-def invalid_links(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def invalid_links(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
     for path in parts.values():
         if path.is_end:
             continue
 
+        broken_next = bool(path.next) and path.next not in parts
         for part in path.variants:
+            bad = broken_next
+            if broken_next:
+                debug(f"{part.pathname}: next {path.next} was not in {parts.keys()}")
             for choice in part.choices:
                 if choice.target not in parts:
-                    debug(part, f"{choice.target} was not in {parts.keys()}")
-                    nodes.append(part)
+                    debug(f"{part.pathname}: {choice.target} was not in {parts.keys()}")
+                    bad = True
                     break
+            if bad:
+                nodes.append(part)
     return nodes
 
 
-def dead_ends(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def dead_ends(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
     for path in parts.values():
-        if not path.is_end:
+        # a next: fall-through is a continuation, not a dead end
+        if not path.is_end and not path.next:
             for part in path.variants:
                 if not part.choices:
                     nodes.append(part)
     return nodes
 
 
-def fully_conditional(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def fully_conditional(parts: dict[str, NodeIR]) -> list[VariantIR]:
     """every choice needs a flag, so a player missing all of them is stuck"""
     nodes = []
     for path in parts.values():
-        if path.is_end:
+        if path.is_end or (path.next and not path.next_if):
             continue
         for part in path.variants:
-            if part.choices and all(choice.condition for choice in part.choices):
+            if part.choices and all(choice.cond for choice in part.choices):
                 nodes.append(part)
     return nodes
 
 
-def unknown_flags(parts: dict[str, StoryParts]) -> list[StoryPart]:
-    """choices or /if blocks gated on a flag that no part ever sets"""
-    set_flags = {flag for part in all_nodes(parts) for flag in part.sets}
+def unknown_flags(parts: dict[str, NodeIR]) -> list[VariantIR]:
+    """conditions gated on a name that no effect ever writes"""
+    writes = _effect_writes(parts)
     nodes = []
     for path in parts.values():
+        node_reads = _truth_reads(path.next_if)
         for part in path.variants:
-            needed = {
-                condition_reference(c)
-                for c in part_conditions(part)
-                if not condition_is_var(c)
-            }
-            if needed - set_flags:
+            needed = set(node_reads)
+            for cond in variant_conds(part):
+                needed |= _truth_reads(cond)
+            if needed - writes:
                 nodes.append(part)
+                debug(
+                    f"{part.pathname}: unknown flags: "
+                    + ", ".join(sorted(needed - writes))
+                )
     return nodes
 
 
-def unknown_vars(parts: dict[str, StoryParts]) -> list[StoryPart]:
-    """conditions reading a variable that no part ever assigns"""
-    set_vars = {name for part in all_nodes(parts) for name in part.vars}
+def unknown_vars(parts: dict[str, NodeIR]) -> list[VariantIR]:
+    """conditions comparing a variable that no effect ever writes"""
+    writes = _effect_writes(parts)
     nodes = []
     for path in parts.values():
+        node_reads = _cmp_reads(path.next_if)
         for part in path.variants:
-            needed = {
-                condition_reference(c)
-                for c in part_conditions(part)
-                if condition_is_var(c)
-            }
-            if needed - set_vars:
+            needed = set(node_reads)
+            for cond in variant_conds(part):
+                needed |= _cmp_reads(cond)
+            if needed - writes:
                 nodes.append(part)
-                debug(part, "unknown variables: " + ", ".join(needed - set_vars))
+                debug(
+                    f"{part.pathname}: unknown variables: "
+                    + ", ".join(sorted(needed - writes))
+                )
     return nodes
 
 
-def condition_syntax(parts: dict[str, StoryParts]) -> list[StoryPart]:
-    """conditions that are neither a flag name nor a numeric comparison"""
+def condition_syntax(parts: dict[str, NodeIR]) -> list[VariantIR]:
+    """conditions that are not valid at their site (design 1.4)"""
     nodes = []
     for path in parts.values():
+        node_conds = [path.next_if] if path.next_if else []
         for part in path.variants:
-            for condition in part_conditions(part):
-                if error := condition_error(condition):
+            for cond in [*node_conds, *variant_conds(part)]:
+                bad = next((n for n in walk_cond(cond) if n.get("op") == "bad"), None)
+                if bad:
                     nodes.append(part)
-                    debug(part, error)
+                    debug(
+                        f"{part.pathname}: condition {bad.get('raw')!r}: "
+                        f"{bad.get('why')}"
+                    )
                     break
     return nodes
 
 
-def conditional_blocks(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def conditional_blocks(parts: dict[str, NodeIR]) -> list[VariantIR]:
     """/if, /else and /endif must nest correctly within each part"""
     nodes = []
     for path in parts.values():
         for part in path.variants:
-            stack: list[bool] = []  # one entry per open /if, tracks a seen /else
-            problem = None
-            for lineno, line in enumerate(part.text.splitlines(), 1):
-                stripped = line.strip()
-                if IF_PATTERN.match(stripped):
-                    stack.append(False)
-                elif ELSE_PATTERN.match(stripped):
-                    if not stack:
-                        problem = f"/else on line {lineno} with no open /if"
-                        break
-                    if stack[-1]:
-                        problem = f"second /else on line {lineno}"
-                        break
-                    stack[-1] = True
-                elif ENDIF_PATTERN.match(stripped):
-                    if not stack:
-                        problem = f"/endif on line {lineno} with no open /if"
-                        break
-                    stack.pop()
-            if problem is None and stack:
-                problem = "an /if is never closed with /endif"
-            if problem:
+            if part.block_error:
                 nodes.append(part)
-                debug(part, problem)
+                debug(f"{part.pathname}: {part.block_error}")
     return nodes
 
 
-def continuing_ends(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def continuing_ends(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
     for path in parts.values():
         if path.is_end:
@@ -460,7 +1161,7 @@ def continuing_ends(parts: dict[str, StoryParts]) -> list[StoryPart]:
     return nodes
 
 
-def revisit_variants(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def revisit_variants(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
     for path in parts.values():
         for part in path.variants:
@@ -469,7 +1170,7 @@ def revisit_variants(parts: dict[str, StoryParts]) -> list[StoryPart]:
     return nodes
 
 
-def noncontinuing_variants(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def noncontinuing_variants(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
     for path in parts.values():
         variant_choices = any(len(part.choices) > 0 for part in path.variants)
@@ -479,7 +1180,7 @@ def noncontinuing_variants(parts: dict[str, StoryParts]) -> list[StoryPart]:
     return nodes
 
 
-def single_choice(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def single_choice(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
     for path in parts.values():
         if not path.is_end:
@@ -496,7 +1197,7 @@ def single_choice(parts: dict[str, StoryParts]) -> list[StoryPart]:
     return nodes
 
 
-def duplicate_choices(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def duplicate_choices(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
     for path in parts.values():
         if not path.is_end:
@@ -506,7 +1207,7 @@ def duplicate_choices(parts: dict[str, StoryParts]) -> list[StoryPart]:
     return nodes
 
 
-def unreachable_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def unreachable_nodes(parts: dict[str, NodeIR]) -> list[VariantIR]:
     stack = starting_nodes(parts)
     every_node = all_nodes(parts)
     if not stack:
@@ -528,14 +1229,14 @@ def unreachable_nodes(parts: dict[str, StoryParts]) -> list[StoryPart]:
     return [node for node in every_node if node.pathname not in visited]
 
 
-def looping_nodes(parts: dict[str, StoryParts]) -> list[list[StoryPart]]:
-    loops: list[list[StoryPart]] = []
+def looping_nodes(parts: dict[str, NodeIR]) -> list[list[VariantIR]]:
+    loops: list[list[VariantIR]] = []
     # dense menus make the walkable paths explode combinatorially; stop after
     # a generous budget so validation always finishes (small stories finish
     # long before the cap, so their output is unaffected)
     budget = 50_000
 
-    def depth_search(node: StoryPart, ancestors: list[StoryPart] | None = None) -> None:
+    def depth_search(node: VariantIR, ancestors: list[VariantIR] | None = None) -> None:
         nonlocal budget
         if budget <= 0:
             return
@@ -565,7 +1266,9 @@ def looping_nodes(parts: dict[str, StoryParts]) -> list[list[StoryPart]]:
     for node in starting_nodes(parts):
         depth_search(node)
 
-    def canonical_looping(loop: list[StoryPart]) -> tuple[list[StoryPart], list[str]]:
+    def canonical_looping(
+        loop: list[VariantIR],
+    ) -> tuple[list[VariantIR], list[str]]:
         names = [part.pathname for part in loop]
         # the loop closes on itself, trim everything before the first repeat
         start = names.index(names[-1])
@@ -578,7 +1281,7 @@ def looping_nodes(parts: dict[str, StoryParts]) -> list[list[StoryPart]]:
         best = rotations.index(min(rotations))
         return loop[best:] + loop[:best], names[best:] + names[:best]
 
-    unique: list[list[StoryPart]] = []
+    unique: list[list[VariantIR]] = []
     unique_name: list[list[str]] = []
     for loop in loops:
         this_loop, this_name = canonical_looping(loop)
@@ -589,7 +1292,7 @@ def looping_nodes(parts: dict[str, StoryParts]) -> list[list[StoryPart]]:
     return unique
 
 
-def _nodes_reaching_end(parts: dict[str, StoryParts]) -> set[str]:
+def _nodes_reaching_end(parts: dict[str, NodeIR]) -> set[str]:
     """every node that can reach an ending, via one reverse breadth-first pass"""
     cached = getattr(_nodes_reaching_end, "_cache", None)
     if cached is not None and cached[0] is parts:
@@ -614,7 +1317,7 @@ def _nodes_reaching_end(parts: dict[str, StoryParts]) -> set[str]:
     return reachable
 
 
-def can_escape_loop(parts: dict[str, StoryParts], loop: list[StoryPart]) -> bool:
+def can_escape_loop(parts: dict[str, NodeIR], loop: list[VariantIR]) -> bool:
     """can the story reach an ending without going back around this loop"""
     # walking every path from every loop node re-exploded on dense graphs;
     # reachability is direction-independent, so one reverse pass answers all
@@ -623,22 +1326,26 @@ def can_escape_loop(parts: dict[str, StoryParts], loop: list[StoryPart]) -> bool
     return any(node.pathname in reaching for node in loop)
 
 
-def escapable_looping_nodes(parts: dict[str, StoryParts]) -> list[list[StoryPart]]:
+def escapable_looping_nodes(
+    parts: dict[str, NodeIR],
+) -> list[list[VariantIR]]:
     return [loop for loop in looping_nodes(parts) if can_escape_loop(parts, loop)]
 
 
-def inescapable_looping_nodes(parts: dict[str, StoryParts]) -> list[list[StoryPart]]:
+def inescapable_looping_nodes(
+    parts: dict[str, NodeIR],
+) -> list[list[VariantIR]]:
     return [loop for loop in looping_nodes(parts) if not can_escape_loop(parts, loop)]
 
 
-def abnormal_paths(parts: dict[str, StoryParts]) -> list[list[StoryPart]]:
-    all_paths: list[list[StoryPart]] = []
+def abnormal_paths(parts: dict[str, NodeIR]) -> list[list[VariantIR]]:
+    all_paths: list[list[VariantIR]] = []
     visited_paths: set[tuple[str]] = set()
     # same budget idea as looping_nodes: generous enough that small stories
     # enumerate completely, finite so a dense graph cannot hang the build
     budget = 50_000
 
-    def traverse(node: StoryPart, path: list[StoryPart] | None = None):
+    def traverse(node: VariantIR, path: list[VariantIR] | None = None):
         nonlocal budget
         if budget <= 0:
             return
@@ -688,7 +1395,7 @@ def abnormal_paths(parts: dict[str, StoryParts]) -> list[list[StoryPart]]:
     return [path for path in all_paths if abs(len(path) - average_path) > 1]
 
 
-def unknown_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def unknown_markers(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
 
     for path in parts.values():
@@ -716,16 +1423,19 @@ def unknown_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
 
                 if markers := re.findall(r"(?:^|[^`\w])(/\w[\w.-]*)", stripped):
                     nodes.append(part)
-                    debug(part, "Unknown markers in text: " + ", ".join(markers))
+                    debug(
+                        f"{part.pathname}: Unknown markers in text: "
+                        + ", ".join(markers)
+                    )
 
     return nodes
 
 
 def command_metadata(
-    parts: dict[str, StoryParts],
+    parts: dict[str, NodeIR],
     regex: re.Pattern[str] = META_COLOUR_PATTERN,
     property: str = "colour",
-) -> list[StoryPart]:
+) -> list[VariantIR]:
     nodes = []
 
     for path in parts.values():
@@ -734,18 +1444,18 @@ def command_metadata(
             if not match:
                 continue
             if not isinstance(match, str) or not regex.match(match):
-                debug(part, "has invalid metadata pattern")
+                debug(f"{part.pathname}: has invalid metadata pattern")
                 nodes.append(part)
 
     return nodes
 
 
 def commands_in_text(
-    parts: dict[str, StoryParts],
+    parts: dict[str, NodeIR],
     regex: re.Pattern[str] = META_COLOUR_PATTERN,
     allow_multiple: bool = False,
     only: bool = False,
-) -> list[StoryPart]:
+) -> list[VariantIR]:
     nodes = []
 
     for path in parts.values():
@@ -757,96 +1467,99 @@ def commands_in_text(
 
                 markers = regex.findall(stripped)
                 if not allow_multiple and len(markers) > 1:
+                    debug(f"{part.pathname}: has more than one marker")
                     nodes.append(part)
-                    debug(part, "has more than one marker")
                     break
 
                 if markers and not stripped.startswith("/"):
+                    debug(f"{part.pathname}: has markers not at the start of the text")
                     nodes.append(part)
-                    debug(part, "has markers not at the start of the text")
                     break
 
                 if markers and only and regex.sub("", stripped).strip():
+                    debug(
+                        f"{part.pathname}: has other markers despite being "
+                        "an exclusive line"
+                    )
                     nodes.append(part)
-                    debug(part, "has other markers despite being an exclusive line")
                     break
 
     return nodes
 
 
-def colour_metadata(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def colour_metadata(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return command_metadata(parts, META_COLOUR_PATTERN, "colour")
 
 
-def colour_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def colour_markers(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return commands_in_text(parts, COLOUR_PATTERN)
 
 
-def pace_metadata(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def pace_metadata(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return command_metadata(parts, META_PACE_PATTERN, "pace")
 
 
-def pace_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def pace_markers(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return commands_in_text(parts, PACE_PATTERN)
 
 
-def effect_metadata(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def effect_metadata(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return command_metadata(parts, META_EFFECT_PATTERN, "effect")
 
 
-def effect_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def effect_markers(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return commands_in_text(parts, EFFECT_PATTERN, allow_multiple=True)
 
 
-def pov_metadata(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def pov_metadata(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return command_metadata(parts, META_POV_PATTERN, "pov")
 
 
-def pov_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def pov_markers(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return commands_in_text(parts, POV_PATTERN)
 
 
-def message_metadata(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def message_metadata(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return command_metadata(parts, META_MESSAGE_PATTERN, "messagepov")
 
 
-def message_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def message_markers(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return commands_in_text(parts, MESSAGE_PATTERN)
 
 
-def message_title_metadata(parts: dict[str, StoryParts]) -> list[StoryPart]:
-    return command_metadata(parts, META_MESSAGE_TITLE_PATTERN, "message-title")
+def message_title_metadata(parts: dict[str, NodeIR]) -> list[VariantIR]:
+    return command_metadata(parts, META_MESSAGE_TITLE_PATTERN, "messagetitle")
 
 
-def message_title_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def message_title_markers(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return commands_in_text(parts, MESSAGE_TITLE_PATTERN, only=True)
 
 
-def weather_metadata(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def weather_metadata(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return command_metadata(parts, META_WEATHER_PATTERN, "weather")
 
 
-def weather_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def weather_markers(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return commands_in_text(parts, WEATHER_PATTERN, only=True)
 
 
-def background_metadata(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def background_metadata(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return command_metadata(parts, META_COLOUR_PATTERN, "background")
 
 
-def background_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def background_markers(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return commands_in_text(parts, BACKGROUND_COLOUR_PATTERN, only=True)
 
 
-def pause_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def pause_markers(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return commands_in_text(parts, PAUSE_PATTERN, only=True)
 
 
-def background_effect_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def background_effect_markers(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return commands_in_text(parts, BACKGROUND_EFFECTS_PATTERN, only=True)
 
 
-def sfx_markers(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def sfx_markers(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return commands_in_text(parts, SFX_PATTERN, only=True)
 
 
@@ -860,7 +1573,7 @@ def _asset_missing(value: str | None, folder: str) -> bool:
     return not (Path("src") / folder / value).is_file()
 
 
-def missing_images(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def missing_images(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return [
         part
         for path in parts.values()
@@ -869,7 +1582,7 @@ def missing_images(parts: dict[str, StoryParts]) -> list[StoryPart]:
     ]
 
 
-def missing_music(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def missing_music(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return [
         part
         for path in parts.values()
@@ -878,7 +1591,7 @@ def missing_music(parts: dict[str, StoryParts]) -> list[StoryPart]:
     ]
 
 
-def missing_sfx(parts: dict[str, StoryParts]) -> list[StoryPart]:
+def missing_sfx(parts: dict[str, NodeIR]) -> list[VariantIR]:
     nodes = []
     for path in parts.values():
         for part in path.variants:
@@ -890,45 +1603,114 @@ def missing_sfx(parts: dict[str, StoryParts]) -> list[StoryPart]:
     return nodes
 
 
-def generate_json(parts: dict[str, StoryParts]) -> dict[str, Any]:
-    output = {}
-    for pathname, part in parts.items():
-        output[pathname] = {
-            "start": part.is_start,
-            "end": part.is_end,
-            "revisit": part.revisit,
-            "variants": [
-                {
-                    "choices": [
-                        {"label": c.label, "to": c.target}
-                        | ({"if": c.condition} if c.condition else {})
-                        for c in v.choices
-                    ],
-                    "text": v.text,
-                }
-                | ({"sets": v.sets} if v.sets else {})
-                | ({"vars": v.vars} if v.vars else {})
-                | ({"image": v.image} if v.image else {})
-                | ({"music": v.music} if v.music else {})
-                | ({"pace": v.pace} if v.pace else {})
-                | ({"colour": v.colour} if v.colour else {})
-                | ({"effect": v.effect} if v.effect else {})
-                | ({"pov": v.pov} if v.pov else {})
-                | ({"messagepov": v.messagepov} if v.messagepov else {})
-                | ({"messagetitle": v.messagetitle} if v.messagetitle else {})
-                | ({"weather": v.weather} if v.weather else {})
-                | ({"background": v.background} if v.background else {})
-                for v in part.variants
-            ],
+def unknown_keys(parts: dict[str, NodeIR]) -> list[VariantIR]:
+    """misspelled or not-yet-implemented frontmatter keys (design 4.1)"""
+    nodes = []
+    for path in parts.values():
+        for part in path.variants:
+            if part.unknown_keys:
+                nodes.append(part)
+                debug(f"{part.pathname}: " + ", ".join(part.unknown_keys))
+    return nodes
+
+
+def count_range(parts: dict[str, NodeIR]) -> list[VariantIR]:
+    """level 3 counts must satisfy 0 <= N <= M <= len(entries) (design 1.4)"""
+    nodes = []
+    for path in parts.values():
+        node_conds = [path.next_if] if path.next_if else []
+        for part in path.variants:
+            problem = None
+            for cond in [*node_conds, *variant_conds(part)]:
+                for node in walk_cond(cond):
+                    if node.get("op") != "count":
+                        continue
+                    size = len(node.get("args", []))
+                    low = node.get("min", 0)
+                    high = node.get("max")
+                    # max is null for unbounded groups (any/at_least): only
+                    # the min side is checkable against the entry count
+                    if low > size or (high is not None and (high > size or low > high)):
+                        problem = f"count group {low}..{high} outside 0..{size} entries"
+                        break
+                if problem:
+                    break
+            if problem:
+                nodes.append(part)
+                debug(f"{part.pathname}: {problem}")
+    return nodes
+
+
+# ---------------------------------------------------------------------------
+# emit story.json v2 (design 2.1): serialization only, no decisions here
+# ---------------------------------------------------------------------------
+
+
+def node_title(node: NodeIR) -> str | None:
+    """frontmatter title, else the first text line (design 1.2)"""
+    if node.title:
+        return node.title
+    for variant in node.variants:
+        for line in variant.lines:
+            text = "".join(tok["v"] for tok in line if tok["t"] == "lit").strip()
+            if text:
+                return text
+    return None
+
+
+def emit_variant(variant: VariantIR) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "lines": variant.lines,
+        "choices": [
+            {"label": choice.label, "to": choice.target}
+            | ({"if": choice.cond} if choice.cond else {})
+            for choice in variant.choices
+        ],
+    }
+    if variant.effects:
+        out["effects"] = variant.effects
+    for attr in PRESENTATION_KEYS.values():
+        if value := getattr(variant, attr):
+            out[attr] = value
+    return out
+
+
+def generate_json(parts: dict[str, NodeIR]) -> dict[str, Any]:
+    nodes: dict[str, Any] = {}
+    for node_id, node in parts.items():
+        entry: dict[str, Any] = {
+            "start": node.is_start,
+            "end": node.is_end,
+            "revisit": node.revisit,
+            "title": node_title(node),
+            "chapter": node.chapter,
         }
-    return output
+        if node.next:
+            entry["next"] = node.next
+        if node.next_if:
+            entry["nextIf"] = node.next_if
+        entry["variants"] = [emit_variant(v) for v in node.variants]
+        nodes[node_id] = entry
+
+    ends = [node_id for node_id, node in parts.items() if node.is_end]
+    return {
+        "version": 2,
+        "nodes": nodes,
+        "ends": ends,
+        "meta": {"endings": [{"id": i, "title": node_title(parts[i])} for i in ends]},
+    }
+
+
+# ---------------------------------------------------------------------------
+# reporting: same output shape as the v1 generator
+# ---------------------------------------------------------------------------
 
 
 def pretty_print_paths(
     value: Any, indent: int = 0, separators: list[str] | None = None, limit: int = 8
 ):
     """
-    Nicely prints StoryPart(s) or nested paths with custom separators per depth.
+    Nicely prints VariantIR(s) or nested paths with custom separators per depth.
     """
     if separators is None:
         separators = [", ", "; ", " - "]
@@ -936,7 +1718,7 @@ def pretty_print_paths(
     def format_paths(val: Any, depth: int = 0) -> str:
         sep = separators[depth] if depth < len(separators) else separators[-1]
 
-        if isinstance(val, StoryPart):
+        if isinstance(val, VariantIR):
             return val.filepath.name
         elif isinstance(val, list):
             return sep.join(sorted({format_paths(v, depth + 1) for v in val}))
@@ -970,7 +1752,7 @@ def failure(text: str) -> None:
 
 @dataclass
 class StoryCheck:
-    function: Callable[[dict[str, StoryParts]], list[StoryPart] | list[list[StoryPart]]]
+    function: Callable[[dict[str, NodeIR]], list[Any]]
     check_type: str
     required: bool = True
     raise_on_empty: bool = False
@@ -1050,6 +1832,8 @@ def main() -> int:
         StoryCheck(missing_sfx, "parts referencing a missing sound file", True),
         StoryCheck(missing_images, "parts referencing a missing image", True),
         StoryCheck(missing_music, "parts referencing a missing music track", True),
+        StoryCheck(unknown_keys, "parts with unknown frontmatter keys"),
+        StoryCheck(count_range, "parts with count groups out of range"),
     ]
 
     func_pad = 0

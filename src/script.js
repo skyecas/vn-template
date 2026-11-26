@@ -1,3 +1,7 @@
+// Pure renderer for story.json v2 (docs/design.md 2.2-2.4).
+// The state blob is the single source of truth: applyTransition produces a
+// new blob, render only ever reads one.
+
 const storyContainer = document.getElementById("story-container");
 const weatherCanvas = document.getElementById("weather-canvas");
 const effectOverlay = document.getElementById("effect-overlay");
@@ -5,30 +9,494 @@ const effectOverlay = document.getElementById("effect-overlay");
 let config;
 let colours;
 let storyData;
-let povColours = {};
-let lastNode = -1;
 
-// Regexes
+// state after entering each path index; the last entry is the live state
+let currentState;
+let stepStates = [];
 
-let COLOUR_PATTERN;
-let BACKGROUND_PATTERN;
+// ---- state blob (design 2.2) ---------------------------------------------
+const MAX_STRING = 500; // URL bloat guard for string vars
 
-const PACE_PATTERN = /\/(slowest|slower|slow|fastest|faster|fast|pace \d+\s?(ms|s))/ig;
-const PAUSE_PATTERN = /^\/pause \d+\s?(ms|s)$/ig;
+function emptyState() {
+    return {
+        v: 2,
+        path: [],
+        variants: [],
+        vars: {},
+        visits: {},
+        used: [],
+        rng: { seed: 0, n: 0 },
+        call: [],
+        povColours: {},
+    };
+}
 
-const EFFECT_PATTERN = /\/(bounce|blink|glow|wave)/ig;
+// a shared link can be stale or hand edited, never trust its shape; v must
+// equal 2 or the state is refused (old v1 URLs are not migrated)
+function sanitizeState(state) {
+    if (!state || typeof state !== "object" || Array.isArray(state)) return emptyState();
+    if (state.v !== 2) return emptyState();
 
-const POV_PATTERN = /\/pov \w+/ig;
+    const path = [];
+    if (Array.isArray(state.path)) {
+        for (const node of state.path) {
+            if (typeof node !== "string") break;
+            path.push(node);
+        }
+    }
 
-const MESSAGE_UNSENT_PATTERN = /\/message\-unsent \w+/ig;
-const MESSAGE_PATTERN = /\/message (\w+)/ig;
-const MESSAGE_TITLE_PATTERN = /^\/message\-title [^/]+$/ig;
+    const variants = Array.isArray(state.variants)
+        ? state.variants.slice(0, path.length).map(v => (Number.isInteger(v) && v >= 0 ? v : null))
+        : [];
 
-const BACKGROUND_EFFECT_PATTERN = /^\/(?:(focus) (\d+(?:\.\d+)?%|reset)|(effect reset))$/ig;
+    const vars = {};
+    if (state.vars && typeof state.vars === "object" && !Array.isArray(state.vars)) {
+        for (const [key, value] of Object.entries(state.vars)) {
+            if (typeof key !== "string") continue;
+            if (typeof value === "number" && isFinite(value)) vars[key] = value;
+            else if (typeof value === "boolean") vars[key] = value;
+            else if (typeof value === "string") vars[key] = value.slice(0, MAX_STRING);
+        }
+    }
 
-const WEATHER_PATTERN = /^\/(rain|snow|fog|fireflies|sunny|clear|none)$/ig;
+    const visits = {};
+    if (state.visits && typeof state.visits === "object" && !Array.isArray(state.visits)) {
+        for (const [key, value] of Object.entries(state.visits)) {
+            if (typeof key === "string" && Number.isInteger(value) && value > 0) visits[key] = value;
+        }
+    }
 
-const SFX_PATTERN = /^\/sfx ([\w.-]+)$/ig;
+    const used = Array.isArray(state.used) ? state.used.filter(u => typeof u === "string") : [];
+
+    const rng = { seed: 0, n: 0 };
+    if (state.rng && typeof state.rng === "object") {
+        if (Number.isInteger(state.rng.seed)) rng.seed = state.rng.seed;
+        if (Number.isInteger(state.rng.n) && state.rng.n >= 0) rng.n = state.rng.n;
+    }
+
+    const call = Array.isArray(state.call) ? state.call.filter(c => typeof c === "string") : [];
+
+    const povColours = {};
+    if (state.povColours && typeof state.povColours === "object" && !Array.isArray(state.povColours)) {
+        for (const [key, value] of Object.entries(state.povColours)) {
+            if (typeof key === "string" && typeof value === "string") povColours[key] = value;
+        }
+    }
+
+    return { v: 2, path, variants, vars, visits, used, rng, call, povColours };
+}
+
+// UTF-8 safe base64: string vars can hold any characters
+function encodeState(state) {
+    const bytes = new TextEncoder().encode(JSON.stringify(state));
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary);
+}
+
+function decodeState(encoded) {
+    const binary = atob(encoded);
+    const bytes = Uint8Array.from(binary, ch => ch.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+function loadStateFromURL() {
+    const params = new URLSearchParams(window.location.search);
+    const encodedState = params.get("state");
+    if (!encodedState) return emptyState();
+    try {
+        return sanitizeState(decodeState(encodedState));
+    } catch {
+        return emptyState();
+    }
+}
+
+function saveStateToURL(state) {
+    const url = new URL(window.location);
+    url.searchParams.set("state", encodeState(state));
+    // push, not replace: the reader expects the browser Back button to undo
+    // the choice they just made
+    window.history.pushState(null, "", url);
+    updateBackButton();
+}
+
+// ---- seeded rng (design 2.2) ---------------------------------------------
+// one counter drives variant picks, pov colours and dice rolls, so a save or
+// a shared link reproduces the same story
+
+function rngValue(state) {
+    state.rng.n += 1;
+    let x = (state.rng.seed ^ Math.imul(state.rng.n, 0x9e3779b9)) >>> 0;
+    x = Math.imul(x ^ (x >>> 16), 0x85ebca6b) >>> 0;
+    x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35) >>> 0;
+    return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+}
+
+function newSeed() {
+    return Math.floor(Math.random() * 0x7fffffff);
+}
+
+function hash32(...parts) {
+    let h = 0x811c9dc5;
+    for (const part of parts) {
+        const text = String(part);
+        for (let i = 0; i < text.length; i++) {
+            h ^= text.charCodeAt(i);
+            h = Math.imul(h, 0x01000193);
+        }
+        h ^= 0xff;
+        h = Math.imul(h, 0x01000193);
+    }
+    return h >>> 0;
+}
+
+// deterministic permutation: same seed and line always shuffle the same way
+function shuffleOrder(seed, nodeId, lineIndex, length) {
+    const order = Array.from({ length }, (_, i) => i);
+    order.sort((a, b) => hash32(seed, nodeId, lineIndex, a) - hash32(seed, nodeId, lineIndex, b));
+    return order;
+}
+
+// ---- conditions (design 1.4): one evaluator, four levels -------------------
+
+function evalCond(cond, state) {
+    if (!cond) return true;
+    switch (cond.op) {
+        case "truth":
+            return Boolean(state.vars[cond.name]);
+        case "not":
+            return !evalCond(cond.arg, state);
+        case "and":
+            return cond.args.every(arg => evalCond(arg, state));
+        case "or":
+            return cond.args.some(arg => evalCond(arg, state));
+        case "cmp": {
+            const lhs = condSide(cond.lhs, state);
+            const rhs = condSide(cond.rhs, state);
+            switch (cond.cmp) {
+                case ">=": return lhs >= rhs;
+                case "<=": return lhs <= rhs;
+                case ">": return lhs > rhs;
+                case "<": return lhs < rhs;
+                case "==": return lhs === rhs;
+                case "!=": return lhs !== rhs;
+            }
+            return false;
+        }
+        case "visits":
+            return state.visits[cond.id] || 0;
+        case "count": {
+            const hits = cond.args.filter(arg => evalCond(arg, state)).length;
+            return hits >= cond.min && (cond.max === null || hits <= cond.max);
+        }
+        default:
+            return false; // "bad" never renders: condition_syntax fails the build
+    }
+}
+
+// plain string = var reference, {"str": ...} = literal, visits() = a number
+function condSide(side, state) {
+    if (typeof side === "number" || typeof side === "boolean") return side;
+    if (typeof side === "string") return state.vars[side] ?? 0;
+    if (side && typeof side === "object" && "str" in side) return side.str;
+    return evalCond(side, state);
+}
+
+// ---- effects (design 1.5): the only writer of state ------------------------
+
+function applyEffect(effect, state) {
+    switch (effect.op) {
+        case "set":
+            state.vars[effect.name] = true;
+            break;
+        case "clear":
+            delete state.vars[effect.name];
+            break;
+        case "assign":
+            state.vars[effect.name] = effect.val;
+            break;
+        case "add":
+            state.vars[effect.name] = (Number(state.vars[effect.name]) || 0) + effect.val;
+            break;
+        case "roll": {
+            const [count, sides, modifier] = effect.dice;
+            let total = modifier;
+            for (let i = 0; i < count; i++) total += 1 + Math.floor(rngValue(state) * sides);
+            state.vars[effect.var] = total;
+            break;
+        }
+        case "unlock":
+            break; // achievements arrive with the meta work (P3)
+    }
+}
+
+// ---- pov colours -----------------------------------------------------------
+
+// find the canonically cased key for a pov, so "You" and "you" share a colour
+function povKey(pov, existing) {
+    if (!pov || !config.povCaseInsensitive) return pov;
+    const match = Object.keys(existing).find(key => key.toLowerCase() === pov.toLowerCase());
+    return match || pov;
+}
+
+function assignPovColour(state, pov, partpov) {
+    if (!pov) return;
+    const key = povKey(pov, state.povColours);
+    if (state.povColours[key]) return;
+
+    const used = Object.values(state.povColours);
+    let pool = colours.filter(col => !used.includes(col));
+    if (!pool.length) pool = colours;
+
+    const partkey = partpov ? povKey(partpov, state.povColours) : null;
+    if (partkey && state.povColours[partkey]) {
+        const contrasting = pool.filter(col => contrast(col, state.povColours[partkey]) >= 10);
+        if (contrasting.length) pool = contrasting;
+    }
+
+    state.povColours[key] = pool[Math.floor(rngValue(state) * pool.length)];
+}
+
+// a pov the transition walk never saw (stale link) still needs a colour;
+// hash-picked so the same name always lands on the same one, with no mutation
+function povColourFor(state, pov) {
+    const key = povKey(pov, state.povColours);
+    if (state.povColours[key]) return state.povColours[key];
+    if (config.povColours) {
+        const configured = povKey(pov, config.povColours);
+        if (config.povColours[configured]) return config.povColours[configured];
+    }
+    return colours[hash32(key) % colours.length];
+}
+
+// ---- alt branches (design 1.6) --------------------------------------------
+// seq keys off the visit number, cycle wraps, shuffle permutes without a
+// repeat until exhausted; all pure functions of the state blob
+
+function pickAltBranch(token, state, nodeId, visitNumber, lineIndex) {
+    const branches = token.branches;
+    if (!branches.length) return [];
+    let index;
+    if (token.mode === "cycle") {
+        index = visitNumber % branches.length;
+    } else if (token.mode === "shuffle") {
+        const order = shuffleOrder(state.rng.seed, nodeId, lineIndex, branches.length);
+        index = order[visitNumber % branches.length];
+    } else {
+        index = Math.min(visitNumber, branches.length - 1);
+    }
+    return branches[index] || [];
+}
+
+// walk a token stream the way the renderer will: evaluate ifs, pick alts,
+// hand every marker to onToken (design 2.3 step 4 uses this for pov colours)
+function walkTokens(tokens, state, nodeId, visitNumber, lineIndex, onToken) {
+    for (const token of tokens) {
+        switch (token.t) {
+            case "mk":
+                onToken(token);
+                break;
+            case "if": {
+                const branch = evalCond(token.cond, state) ? token.then : token.else;
+                for (const entry of branch) {
+                    walkTokens(entry, state, nodeId, visitNumber, lineIndex, onToken);
+                }
+                break;
+            }
+            case "alt": {
+                const branch = pickAltBranch(token, state, nodeId, visitNumber, lineIndex);
+                for (const entry of branch) {
+                    walkTokens(entry, state, nodeId, visitNumber, lineIndex, onToken);
+                }
+                break;
+            }
+            default:
+                break; // lit and var carry no markers
+        }
+    }
+}
+
+function walkLineList(lines, state, nodeId, visitNumber, onToken) {
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+        const entry = lines[lineIndex];
+        if (entry.length === 1 && entry[0].t === "if") {
+            // block form: only the taken branch is ever visible
+            const branch = evalCond(entry[0].cond, state) ? entry[0].then : entry[0].else;
+            walkLineList(branch, state, nodeId, visitNumber, onToken);
+        } else {
+            walkTokens(entry, state, nodeId, visitNumber, lineIndex, onToken);
+        }
+    }
+}
+
+// every pov a visible line will name gets its colour assigned once, from the
+// seeded rng, while the node is entered (design 2.3 step 4)
+function assignVisiblePovs(state, node, variant) {
+    const seen = new Set();
+    const consider = pov => {
+        if (!pov || seen.has(pov)) return;
+        seen.add(pov);
+        assignPovColour(state, pov, variant.pov);
+    };
+    consider(variant.pov);
+    consider(variant.messagepov);
+    const visitNumber = state.visits[node.id] || 0; // pre-increment: this visit
+    walkLineList(variant.lines, state, node.id, visitNumber, token => {
+        if (token.k === "pov" || token.k === "message" || token.k === "messageUnsent") {
+            consider(token.v);
+        }
+    });
+}
+
+// ---- flow (design 2.3) -----------------------------------------------------
+
+// the choices on screen right now: gated by conditions, revisit, and by a
+// live `next` (an auto-continuing node never surfaces its choices)
+function visibleChoices(state, node, variant, path, index) {
+    if (liveNext(state, node)) return [];
+    return (variant.choices || []).filter(choice => {
+        if (choice.if && !evalCond(choice.if, state)) return false;
+        const target = storyData.nodes[choice.to];
+        if (!target) return true; // unimplemented, sure, let it show
+        const alreadyVisited = path.slice(0, index + 1).includes(choice.to);
+        return !alreadyVisited || target.revisit;
+    });
+}
+
+function liveNext(state, node) {
+    return Boolean(node.next && !node.end && (!node.nextIf || evalCond(node.nextIf, state)));
+}
+
+// a stored variant index wins; anything stale falls back to the first variant
+function nodeVariant(node, index) {
+    if (Number.isInteger(index) && index >= 0 && index < node.variants.length) {
+        return node.variants[index];
+    }
+    return node.variants[0] || { lines: [], choices: [] };
+}
+
+// append a node to the path and run its fresh-entry work (design 2.3 step 4)
+function enterNode(state, nodeId) {
+    state.path.push(nodeId);
+    const node = storyData.nodes[nodeId];
+    if (!node) {
+        state.variants.push(null); // the validator warns; render shows a placeholder
+        return;
+    }
+
+    let pick = 0;
+    if (node.variants.length > 1) {
+        pick = Math.floor(rngValue(state) * node.variants.length);
+    }
+    state.variants.push(pick);
+
+    const variant = node.variants[pick];
+    if (variant.effects) {
+        for (const effect of variant.effects) applyEffect(effect, state);
+    }
+
+    assignVisiblePovs(state, node, variant);
+
+    state.visits[nodeId] = (state.visits[nodeId] || 0) + 1;
+}
+
+// the one place state changes: pure with respect to the caller's blob
+function applyTransition(state, action) {
+    const next = structuredClone(state);
+    // a snapshot per entered node so the renderer can draw each step from the
+    // state exactly as it was right after that step's entry
+    const steps = [];
+    const enter = nodeId => {
+        enterNode(next, nodeId);
+        steps.push({ index: next.path.length - 1, nodeId, state: structuredClone(next) });
+    };
+
+    if (action.type === "start") {
+        next.path = [];
+        next.variants = [];
+        next.vars = {};
+        next.visits = {};
+        next.used = [];
+        next.call = [];
+        next.povColours = { ...(config.povColours || {}) };
+        next.rng = { seed: action.seed ?? newSeed(), n: 0 };
+        const starts = Object.keys(storyData.nodes).filter(id => storyData.nodes[id].start);
+        if (!starts.length) error("No starting story nodes defined");
+        // a replay can name the start node; a fresh run picks at random
+        const nodeId = action.node || starts[Math.floor(Math.random() * starts.length)];
+        enter(nodeId);
+        return { state: next, steps };
+    }
+
+    if (action.type === "restart") {
+        return applyTransition(emptyState(), { type: "start" });
+    }
+
+    if (action.type === "choice" || action.type === "advance") {
+        const nodeId = next.path[next.path.length - 1];
+        const node = storyData.nodes[nodeId];
+        if (!node) return { state: next, steps: [] };
+        const variant = nodeVariant(node, next.variants[next.variants.length - 1]);
+
+        // next is unconditional: it wins over any choices on the node
+        if (action.type === "advance" && liveNext(state, node)) {
+            enter(node.next);
+            return { state: next, steps };
+        }
+
+        const visible = visibleChoices(next, node, variant, next.path, next.path.length - 1);
+        let choice = null;
+        if (action.type === "advance") {
+            if (visible.length === 1) choice = visible[0];
+        } else {
+            choice = visible[action.index];
+        }
+        if (!choice) return { state: next, steps: [] };
+
+        if (choice.effects) {
+            for (const effect of choice.effects) applyEffect(effect, next);
+        }
+        enter(choice.to);
+        return { state: next, steps };
+    }
+
+    return { state: next, steps: [] };
+}
+
+// rebuild the state after every step of a shared link or a save: same seed,
+// same choices, so variant picks and pov colours re-derive exactly
+function computeStepStates(target) {
+    if (!target.path.length) return [];
+    const states = [];
+    let current = applyTransition(emptyState(), {
+        type: "start",
+        node: target.path[0],
+        seed: target.rng.seed,
+    }).state;
+    states.push(current);
+
+    for (let i = 1; i < target.path.length; i++) {
+        const prevId = current.path[current.path.length - 1];
+        const node = storyData.nodes[prevId];
+        let result = null;
+        if (node && liveNext(current, node) && node.next === target.path[i]) {
+            result = applyTransition(current, { type: "advance" });
+        } else if (node) {
+            const variant = nodeVariant(node, current.variants[current.variants.length - 1]);
+            const visible = visibleChoices(current, node, variant, current.path, current.path.length - 1);
+            // first visible choice leading to the recorded target; choice
+            // effects are identical across same-target choices (design 1.3)
+            const index = visible.findIndex(choice => choice.to === target.path[i]);
+            if (index >= 0) result = applyTransition(current, { type: "choice", index });
+        }
+        if (!result || !result.steps.length) break; // stale link: render as far as it still makes sense
+        current = result.state;
+        states.push(current);
+    }
+    return states;
+}
+
+// ---- visual machinery (design 2.4: the unchanged surface) ------------------
 
 function keepView() {
     window.scrollTo({
@@ -76,90 +544,11 @@ function applyTheme() {
     if (theme.cornerRadius) root.setProperty("--radius", theme.cornerRadius);
 }
 
-
+// the named colour list feeds pov assignment; marker matching now happens at
+// build time, so the runtime keeps no marker regexes (design 2.4)
 async function loadColours() {
     const text = await fetch("named_colours").then(r => r.text());
     colours = text.toLowerCase().split(/\r?\n/).filter(Boolean);
-    COLOUR_PATTERN = new RegExp(`\/(${colours.join('|')}|reset|colour #(?:[0-9a-f]{3}){1,2})`, "gi");
-    BACKGROUND_PATTERN = new RegExp(`^\/background (${colours.join('|')}|reset|#(?:[0-9a-f]{3}){1,2})$`, "gi");
-}
-
-// URL to state and back
-function emptyState() {
-    return { path: [], variants: [], povColours: {}, flags: [], vars: {} };
-}
-
-// a shared link can be stale or hand edited, never trust its shape
-function sanitizeState(state) {
-    if (!state || typeof state !== "object" || Array.isArray(state)) return emptyState();
-
-    const path = [];
-    if (Array.isArray(state.path)) {
-        for (const node of state.path) {
-            if (typeof node !== "string") break;
-            path.push(node);
-        }
-    }
-
-    const variants = Array.isArray(state.variants)
-        ? state.variants.slice(0, path.length).map(v => Number.isInteger(v) && v >= 0 ? v : null)
-        : [];
-
-    const povColours = {};
-    if (state.povColours && typeof state.povColours === "object" && !Array.isArray(state.povColours)) {
-        for (const [key, value] of Object.entries(state.povColours)) {
-            if (typeof key === "string" && typeof value === "string") povColours[key] = value;
-        }
-    }
-
-    const flags = Array.isArray(state.flags)
-        ? state.flags.filter(flag => typeof flag === "string")
-        : [];
-
-    const vars = {};
-    if (state.vars && typeof state.vars === "object" && !Array.isArray(state.vars)) {
-        for (const [key, value] of Object.entries(state.vars)) {
-            if (typeof key === "string" && typeof value === "number" && isFinite(value)) {
-                vars[key] = value;
-            }
-        }
-    }
-
-    return { path, variants, povColours, flags, vars };
-}
-
-function loadStateFromURL() {
-    const params = new URLSearchParams(window.location.search);
-    const encodedState = params.get("state");
-    if (!encodedState) return emptyState();
-    try {
-        return sanitizeState(JSON.parse(atob(encodedState)));
-    } catch {
-        return emptyState();
-    }
-}
-
-function statePayload(path, variants) {
-    return JSON.stringify({ path, variants, povColours, flags: [...currentFlags], vars: { ...currentVars } });
-}
-
-function saveStateToURL(path, variants) {
-    const url = new URL(window.location);
-    url.searchParams.set("state", btoa(statePayload(path, variants)));
-    // push, not replace: the reader expects the browser Back button to undo
-    // the choice they just made
-    window.history.pushState(null, "", url);
-    updateBackButton();
-}
-
-// flags raised mid-node still have to survive a reload, so the current entry
-// is rewritten once they are known
-function syncStateToURL() {
-    if (!currentPath.length) return;
-    const url = new URL(window.location);
-    if (!url.searchParams.has("state")) return;
-    url.searchParams.set("state", btoa(statePayload(currentPath, currentVariants)));
-    window.history.replaceState(null, "", url);
 }
 
 // bumped whenever the view is cleared so an in-flight render can notice it
@@ -192,14 +581,6 @@ function triggerSkip() {
 
 // recorded as lines render, replayed when the history panel opens
 let storyHistory = [];
-
-// flags raised by the nodes visited so far; every state snapshot carries
-// them so Back and saves restore the same set
-let currentFlags = new Set();
-
-// numeric variables raised by nodes visited so far; same deal, carried in
-// every snapshot so Back and saves restore them
-let currentVars = {};
 
 // true while a node's lines are still fading in, so a click can fast-forward
 // the reveal instead of advancing the story
@@ -264,35 +645,6 @@ async function fadeText(element) {
     await wait(Math.max(speed, fadeDuration));
 }
 
-function extractRegex(line, regex = COLOUR_PATTERN) {
-    const match = line.match(regex);
-    if (match) {
-        const found = match[0].startsWith("/") ? match[0].slice(1) : match[0];
-        return [found, line.replace(regex, "")];
-    }
-    return [null, line];
-}
-
-function extractRegexArg(line, regex = COLOUR_PATTERN) {
-    const match = line.match(regex);
-    if (match) {
-        const found = match[0].split(" ");
-        const args = found.slice(1).join(" ");
-        return [args, line.replace(regex, ""), found[0].replace("/", "")];
-    }
-    return [null, line];
-}
-
-function extractMultipleRegex(line, regex = EFFECT_PATTERN) {
-    const match = line.match(regex);
-    if (match) {
-        let matches = [];
-        for (const m of match) { matches.push(m.replace("\/", "")); }
-        return [matches, line.replace(regex, "")];
-    }
-    return [null, line];
-}
-
 function toMillis(speed) {
     if (speed.endsWith("ms")) {
         return parseFloat(speed.replace("ms", "").trim());
@@ -316,33 +668,6 @@ function parsePaceMultiplier(pace) {
     }
 
     return config.paceMultipliers[pace] || 1;
-}
-
-// find the canonically cased key for a pov, so "You" and "you" share a colour
-function povKey(pov) {
-    if (!pov || !config.povCaseInsensitive) { return pov; }
-    const match = Object.keys(povColours).find(key => key.toLowerCase() === pov.toLowerCase());
-    return match || pov;
-}
-
-function parsePOVColour(pov, partpov = null) {
-    if (!pov) { return null; }
-    const key = povKey(pov);
-    if (povColours[key]) { return povColours[key]; }
-
-    const used = Object.values(povColours);
-    let pool = colours.filter(col => !used.includes(col));
-    if (!pool.length) { pool = colours; }
-
-    const partkey = partpov ? povKey(partpov) : null;
-    if (partkey && povColours[partkey]) {
-        const contrasting = pool.filter(col => contrast(col, povColours[partkey]) >= 10);
-        if (contrasting.length) { pool = contrasting; }
-    }
-
-    const selected = pool[Math.floor(Math.random() * pool.length)];
-    povColours[key] = selected;
-    return selected;
 }
 
 function parseColor(color) {
@@ -385,10 +710,10 @@ function contrast(fg, bg) {
 }
 
 
-function createPOVContainer(pov, partpov = null) {
+function createPOVContainer(pov, state, partpov = null) {
     const povContainer = document.createElement("div");
     const povName = document.createElement("div");
-    const colour = parsePOVColour(pov, partpov);
+    const colour = povColourFor(state, pov);
 
     povContainer.classList.add("story-pov");
     if (config.povStyle === "box") {
@@ -434,7 +759,7 @@ function adjustTextColour(obj, bgColour) {
     }
 }
 
-function addNewLine(part, line, pov, lastpov, lastpovcontainer, partpov) {
+function addNewLine(part, line, pov, lastpov, lastpovcontainer, partpov, state) {
     if (pov) {
         const isPart = caseCheck(pov) === caseCheck(partpov);
         if (isPart) {
@@ -447,7 +772,7 @@ function addNewLine(part, line, pov, lastpov, lastpovcontainer, partpov) {
             return lastpovcontainer
         } else {
             // change to a new pov container
-            const newpovcontainer = createPOVContainer(pov, !isPart ? partpov : null);
+            const newpovcontainer = createPOVContainer(pov, state, !isPart ? partpov : null);
             adjustTextColour(line, newpovcontainer.style.background);
             newpovcontainer.appendChild(line);
             part.appendChild(newpovcontainer);
@@ -459,8 +784,8 @@ function addNewLine(part, line, pov, lastpov, lastpovcontainer, partpov) {
     }
 }
 
-function formatMessage(storypart, messagecontainer, messageObj, lastmsgObj, pov, lastpov, partpov, unsent, messagetitle) {
-    const povcolour = parsePOVColour(pov, partpov);
+function formatMessage(storypart, messagecontainer, messageObj, lastmsgObj, pov, lastpov, partpov, unsent, messagetitle, state) {
+    const povcolour = povColourFor(state, pov);
     const mainPov = caseCheck(pov) === caseCheck(partpov);
 
     if (!messagecontainer) {
@@ -636,10 +961,11 @@ function updateEffect(effectType, value) {
     effectOverlay.style.transition = `--focus-size ${fadeTime}ms ease`;
 
     switch (effectType) {
-        case "focus":
+        case "focus": {
             const percent = parseFloat(value.replace("reset", "100").replace("%", ""));
             effectOverlay.style.setProperty("--focus-size", `${percent}%`);
             break;
+        }
         default:
             // reset all effects
             effectOverlay.style.setProperty("--focus-size", "105%");
@@ -648,180 +974,242 @@ function updateEffect(effectType, value) {
     }
 }
 
+// ---- token rendering (design 2.1/2.3) -------------------------------------
+// the build already decided what is a marker and what is text; the renderer
+// only evaluates conditions, picks alt branches, and draws what is left
 
-async function renderText(nodeContainer, node, variantIdx) {
+// whole-line markers the lexer keeps exclusive: they never emit text
+const EXCLUSIVE_MARKERS = new Set([
+    "pause", "focus", "effectReset", "background", "weather", "sfx", "messageTitle",
+]);
+
+async function runMarker(token, ctx) {
+    switch (token.k) {
+        case "messageTitle":
+            ctx.messagetitle = token.v;
+            break;
+        case "pause":
+            await wait(toMillis(token.v));
+            break;
+        case "focus":
+            updateEffect("focus", token.v);
+            break;
+        case "effectReset":
+            updateEffect("effectReset", token.v);
+            break;
+        case "background":
+            updateBackground(token.v);
+            break;
+        case "weather":
+            updateWeather(token.v);
+            break;
+        case "sfx":
+            playSfx(token.v);
+            break;
+    }
+}
+
+// one line's worth of state while its token stream is walked; first marker of
+// each kind wins, matching how the old extractor consumed a raw line
+function newMarks() {
+    return {
+        text: "",
+        colour: null,
+        pace: null,
+        effects: [],
+        pov: null,
+        message: null,
+        unsent: null,
+    };
+}
+
+function collectToken(token, ctx, lineIndex, marks) {
+    switch (token.t) {
+        case "lit":
+            marks.text += token.v;
+            break;
+        case "var":
+            // unknown names stay visible as {name}, the old renderer's contract
+            marks.text += token.name in ctx.state.vars
+                ? String(ctx.state.vars[token.name])
+                : `{${token.name}}`;
+            break;
+        case "if": {
+            const branch = evalCond(token.cond, ctx.state) ? token.then : token.else;
+            collectTokens(branch, ctx, lineIndex, marks);
+            break;
+        }
+        case "alt": {
+            const branch = pickAltBranch(token, ctx.state, ctx.node.id, ctx.visitNumber, lineIndex);
+            collectTokens(branch, ctx, lineIndex, marks);
+            break;
+        }
+        case "mk":
+            if (token.k === "colour" && marks.colour === null) marks.colour = token.v;
+            else if (token.k === "pace" && marks.pace === null) marks.pace = token.v;
+            else if (token.k === "effect") marks.effects.push(token.v);
+            else if (token.k === "pov" && marks.pov === null) marks.pov = token.v;
+            else if (token.k === "message" && marks.message === null) marks.message = token.v;
+            else if (token.k === "messageUnsent" && marks.unsent === null) marks.unsent = token.v;
+            break;
+    }
+}
+
+function collectTokens(entries, ctx, lineIndex, marks) {
+    for (const entry of entries) {
+        if (entry.length === 1 && entry[0].t === "if") {
+            // block form nested inside a line: only the taken branch counts
+            const branch = evalCond(entry[0].cond, ctx.state) ? entry[0].then : entry[0].else;
+            collectTokens(branch, ctx, lineIndex, marks);
+            continue;
+        }
+        for (const token of entry) collectToken(token, ctx, lineIndex, marks);
+    }
+}
+
+async function renderLineTokens(entry, ctx, lineIndex) {
+    // a whole-line marker runs its command and emits no text
+    if (entry.length === 1 && entry[0].t === "mk" && EXCLUSIVE_MARKERS.has(entry[0].k)) {
+        await runMarker(entry[0], ctx);
+        return;
+    }
+
+    const marks = newMarks();
+    collectTokens([entry], ctx, lineIndex, marks);
+
+    const storyLine = document.createElement("div");
+    storyLine.className = "story-line";
+
+    if (marks.colour !== null) {
+        storyLine.style.color = marks.colour.replace("colour", "").replace("reset", config.textColour).trim();
+    }
+    if (marks.effects.length) storyLine.classList.add(...marks.effects);
+    if (ctx.effectPart.length) storyLine.classList.add(...ctx.effectPart);
+
+    // parse markdown to html; marked allows raw html through, so it goes
+    // into innerHTML only after DOMPurify has stripped anything active
+    storyLine.innerHTML = DOMPurify.sanitize(marked.parse(marks.text));
+
+    storyHistory.push({ html: storyLine.innerHTML, pov: marks.pov || ctx.partpov });
+
+    // render as a message or not
+    const foundmessagepov = marks.unsent || marks.message;
+    if (foundmessagepov) {
+        if (!ctx.partmessagepov) ctx.partmessagepov = foundmessagepov;
+        [ctx.messagescontainer, ctx.lastmessageobj, ctx.lastmessagepov] = formatMessage(
+            ctx.storyPart,
+            ctx.messagescontainer,
+            storyLine,
+            ctx.lastmessageobj,
+            foundmessagepov,
+            ctx.lastmessagepov,
+            ctx.partmessagepov,
+            marks.unsent,
+            ctx.messagetitle || ctx.messageparttitle,
+            ctx.state
+        );
+        ctx.lastpovcontainer = null;
+        ctx.lastpov = null;
+    } else {
+        ctx.messagescontainer = null;
+        ctx.lastmessageobj = null;
+        ctx.lastmessagepov = null;
+        ctx.messagetitle = null;
+        ctx.lastpovcontainer = addNewLine(
+            ctx.partpovcontainer || ctx.storyPart,
+            storyLine,
+            marks.pov || ctx.partpov,
+            ctx.lastpov,
+            ctx.lastpovcontainer,
+            ctx.partpov,
+            ctx.state
+        );
+        ctx.lastpov = marks.pov || ctx.partpov;
+    }
+
+    // ensure we wait the right amount of time between lines of text
+    const speed = parsePaceMultiplier(marks.pace) * ctx.partPace * config.textSpeed;
+    storyLine.dataset.speed = speed;
+    await fadeText(storyLine);
+}
+
+async function renderLineList(entries, ctx) {
+    for (let lineIndex = 0; lineIndex < entries.length; lineIndex++) {
+        const entry = entries[lineIndex];
+        if (entry.length === 1 && entry[0].t === "if") {
+            // block form: only the taken branch is ever visible
+            const branch = evalCond(entry[0].cond, ctx.state) ? entry[0].then : entry[0].else;
+            await renderLineList(branch, ctx);
+            continue;
+        }
+        await renderLineTokens(entry, ctx, lineIndex);
+    }
+}
+
+async function renderText(nodeContainer, state, node, variant) {
     const storyPart = document.createElement("div");
     storyPart.className = "story-part";
 
     nodeContainer.appendChild(storyPart);
 
-    const variant = node.variants[variantIdx];
     textRevealing = true;
 
-    // extract the node colour choice
-    const partColour = variant.colour;
-    storyPart.style.color = partColour;
+    // the node colour choice
+    if (variant.colour) storyPart.style.color = variant.colour;
 
-    // extract the speed for this part
+    // the speed for this part
     const partPace = parsePaceMultiplier(variant.pace);
 
-    // extract any effect classes
+    // any effect classes
     const effectPart = variant.effect ? variant.effect.split() : [];
 
     const partpov = variant.pov;
     let partpovcontainer;
     if (partpov) {
-        partpovcontainer = createPOVContainer(partpov);
+        partpovcontainer = createPOVContainer(partpov, state);
         storyPart.appendChild(partpovcontainer)
     }
-    let lastpov;
-    let lastpovcontainer;
 
-    // messaging pov
-    let partmessagepov = variant.messagepov || partpov;
-    let lastmessageobj;
-    let lastmessagepov;
-    let messagescontainer;
-
-    // messaging title
-    const messageparttitle = variant.messagetitle;
-    let messagetitle;
-
-    // background effects
     updateBackground(variant.background);
     updateImage(variant.image);
     updateWeather(variant.weather);
     updateMusic(variant.music);
 
-    // print the lines
-    const lines = variant.text.split("\n").filter(elem => elem.trim());
-    // conditional blocks: /if <cond> ... [/else] ... /endif; a line renders
-    // only when every enclosing block is showing
-    const condStack = [];
-    const showing = () => condStack.every(entry => entry.show);
-    for (const line of lines) {
-        const stripped = line.trim();
+    // the context every line shares; branch state (pov chains, message
+    // containers, the node's title) carries across lines like the old loop
+    const ctx = {
+        state,
+        node,
+        storyPart,
+        partPace,
+        effectPart,
+        partpov,
+        partpovcontainer,
+        // pre-increment visit number: branch 0 on the first visit, matching
+        // the walk assignVisiblePovs did while entering the node
+        visitNumber: Math.max(0, (state.visits[node.id] || 1) - 1),
+        partmessagepov: variant.messagepov || partpov,
+        messageparttitle: variant.messagetitle,
+        messagetitle: null,
+        messagescontainer: null,
+        lastmessageobj: null,
+        lastmessagepov: null,
+        lastpov: null,
+        lastpovcontainer: null,
+    };
 
-        const ifMatch = stripped.match(/^\/if\s+(.+)$/i);
-        if (ifMatch) {
-            condStack.push({ show: evalCondition(ifMatch[1]), orElse: false });
-            continue;
-        }
-        if (/^\/else$/i.test(stripped)) {
-            const entry = condStack[condStack.length - 1];
-            if (entry) entry.show = !entry.show;
-            continue;
-        }
-        if (/^\/endif$/i.test(stripped)) {
-            condStack.pop();
-            continue;
-        }
-
-        // inside a block whose condition failed: skip the line entirely, so it
-        // never renders, never enters history, and never fires a command
-        if (!showing()) continue;
-
-        // single line commands that should exit early
-        const foundtitle = extractRegexArg(line, MESSAGE_TITLE_PATTERN)[0];
-        if (foundtitle) {
-            messagetitle = foundtitle.replace("message-title", "").trim();
-            continue;
-        }
-
-        const foundpause = extractRegexArg(line, PAUSE_PATTERN)[0];
-        if (foundpause) {
-            await wait(toMillis(foundpause));
-            continue;
-        }
-
-        const [foundbgvalue, _, foundbgeffect] = extractRegexArg(line, BACKGROUND_EFFECT_PATTERN);
-        if (foundbgeffect) {
-            updateEffect(foundbgeffect, foundbgvalue);
-            continue
-        }
-
-        const foundbackground = extractRegexArg(line, BACKGROUND_PATTERN)[0];
-        if (foundbackground) {
-            updateBackground(foundbackground);
-            continue
-        }
-
-        const foundweather = extractRegex(line, WEATHER_PATTERN)[0];
-        if (foundweather) {
-            updateWeather(foundweather);
-            continue
-        }
-
-        const foundsfx = extractRegexArg(line, SFX_PATTERN)[0];
-        if (foundsfx) {
-            playSfx(foundsfx);
-            continue
-        }
-
-        // commands that still output text
-        const storyLine = document.createElement("div");
-        storyLine.className = "story-line";
-
-        const [col, colourless_line] = extractRegex(line, COLOUR_PATTERN);
-        if (col) { storyLine.style.color = col.replace("colour", "").replace("reset", config.textColour).trim(); }
-
-        const [pace, paceless_line] = extractRegex(colourless_line, PACE_PATTERN);
-
-        const [effects, effectless_text] = extractMultipleRegex(paceless_line, EFFECT_PATTERN);
-        if (effects) { storyLine.classList.add(...effects); };
-        if (effectPart) { storyLine.classList.add(...effectPart); };
-
-        // register povs if needed
-        const [pov, povlesstext] = extractRegexArg(effectless_text, POV_PATTERN);
-
-        // determine any messages
-        const [unsentmessagepov, unsentlesstext] = extractRegexArg(povlesstext, MESSAGE_UNSENT_PATTERN);
-        const [messagepov, messagelesstext] = extractRegexArg(unsentlesstext, MESSAGE_PATTERN);
-
-        // substitute {name} references to numeric variables so a score or
-        // health value can appear inline; unknown names are left alone
-        const substituted = messagelesstext.replace(/\{(\w+)\}/g, (m, name) =>
-            name in currentVars ? String(currentVars[name]) : m
-        );
-
-        // parse markdown to html; marked allows raw html through, so it goes
-        // into innerHTML only after DOMPurify has stripped anything active
-        storyLine.innerHTML = DOMPurify.sanitize(marked.parse(substituted));
-
-        storyHistory.push({ html: storyLine.innerHTML, pov: pov || partpov });
-
-        // render as a message or not
-        const foundmessagepov = unsentmessagepov || messagepov;
-        if (foundmessagepov) {
-            if (!partmessagepov) { partmessagepov = foundmessagepov; }
-            [messagescontainer, lastmessageobj, lastmessagepov] = formatMessage(storyPart, messagescontainer, storyLine, lastmessageobj, foundmessagepov, lastmessagepov, partmessagepov, unsentmessagepov, messagetitle || messageparttitle);
-            lastpovcontainer = null;
-            lastpov = null;
-        } else {
-            messagescontainer = null;
-            lastmessageobj = null;
-            lastmessagepov = null;
-            messagetitle = null;
-            lastpovcontainer = addNewLine(partpovcontainer || storyPart, storyLine, pov || partpov, lastpov, lastpovcontainer, partpov);
-            lastpov = pov || variant.pov;
-        }
-
-        // ensure we wait the right amount of time between lines of text
-        const speed = parsePaceMultiplier(pace) * partPace * config.textSpeed;
-        storyLine.dataset.speed = speed;
-        await fadeText(storyLine);
-    }
+    await renderLineList(variant.lines || [], ctx);
     textRevealing = false;
 }
 
-// the choices the reader can pick right now: the current node's, once they
-// have finished fading in (past choices stay disabled)
+// the choices on screen right now: gated by conditions and by revisit
 function activeChoiceButtons() {
     return [...storyContainer.querySelectorAll(".story-choice.active:not(:disabled)")];
 }
 
 // click / Space / Enter: finish the text reveal if it is still going, else
-// follow the one choice when the story is linear at this point
+// follow the one choice when the story is linear at this point, else follow
+// an unconditional `next`
 function advanceOrReveal() {
     cancelAutoAdvance();
     if (textRevealing) {
@@ -829,7 +1217,11 @@ function advanceOrReveal() {
         return;
     }
     const choices = activeChoiceButtons();
-    if (choices.length === 1) choices[0].click();
+    if (choices.length === 1) {
+        choices[0].click();
+        return;
+    }
+    if (!choices.length) applyAndRender({ type: "advance" });
 }
 
 function unselectChoices() {
@@ -860,72 +1252,17 @@ function redoButton() {
     return button;
 }
 
-// a story.json written before flags existed has a flat label -> target map
-function normaliseChoices(choices) {
-    if (!choices) return [];
-    if (Array.isArray(choices)) return choices;
-    return Object.entries(choices).map(([label, to]) => ({ label, to }));
-}
-
-function visitable(path, choices) {
-    return normaliseChoices(choices).filter(choice => {
-        // gated on a condition the reader has not satisfied yet
-        if (choice.if && !choice.if.every(evalCondition)) return false;
-
-        const node = storyData[choice.to];
-        if (!node) return true; // unimplemented, sure, let it show
-        const alreadyVisited = path.slice(0, lastNode + 2).includes(choice.to);
-        return !alreadyVisited || node.revisit;
-    });
-}
-
-// a condition is a (possibly negated) flag name, or a numeric comparison
-// against a variable: score >= 10
-function evalCondition(condition) {
-    let cond = String(condition).trim();
-    let negate = false;
-    if (/^not\s+/i.test(cond)) {
-        negate = true;
-        cond = cond.replace(/^not\s+/i, "").trim();
-    }
-
-    let result;
-    const cmp = cond.match(/^(.+?)\s*(>=|<=|==|!=|>|<)\s*(-?\d+(?:\.\d+)?)$/);
-    if (cmp) {
-        const current = currentVars[cmp[1].trim()] ?? 0;
-        const target = parseFloat(cmp[3]);
-        switch (cmp[2]) {
-            case ">=": result = current >= target; break;
-            case "<=": result = current <= target; break;
-            case ">": result = current > target; break;
-            case "<": result = current < target; break;
-            case "==": result = current === target; break;
-            case "!=": result = current !== target; break;
-        }
-    } else {
-        result = currentFlags.has(cond);
-    }
-
-    return negate ? !result : result;
-}
-
-
-async function renderChoices(nodeContainer, path, variants, storyIndex, node, variantIdx) {
+async function renderChoices(nodeContainer, state, storyIndex, node, variant, isCurrent) {
     const choicesContainer = document.createElement("div");
     choicesContainer.className = "story-choices";
     nodeContainer.appendChild(choicesContainer);
 
-    // fetch the variants so we can find the choices allowed
-    const variant = node.variants[variantIdx];
+    // the choices this step's state allows
+    const choices = visibleChoices(state, node, variant, state.path, storyIndex);
 
-    // fetch the choices for this node
-    const choices = variant.choices ? visitable(path, variant.choices) : [];
-
-    // determine if these choices have already been made
-    const isCurrent = storyIndex >= path.length - 1;
-
-    // and if there are further choices to be made
-    const isEnd = node.end || choices.length === 0;
+    // an ending, or a node with no live exit, offers a restart instead; a
+    // node about to follow `next` shows nothing and continues on advance
+    const isEnd = node.end || (choices.length === 0 && !liveNext(state, node));
 
     const buttons = [];
 
@@ -935,7 +1272,8 @@ async function renderChoices(nodeContainer, path, variants, storyIndex, node, va
     }
     // otherwise, show the choices
     else {
-        for (const choice of choices) {
+        for (let i = 0; i < choices.length; i++) {
+            const choice = choices[i];
             const choiceButton = document.createElement("button");
             choiceButton.type = "button";
             choiceButton.className = "story-choice";
@@ -946,7 +1284,7 @@ async function renderChoices(nodeContainer, path, variants, storyIndex, node, va
             // unselected past choices get the class applied
             if (!isCurrent) {
                 // if the next part of the story is this past choices target, it was chosen
-                if (path[storyIndex + 1] === choice.to) {
+                if (currentState.path[storyIndex + 1] === choice.to) {
                     choiceButton.classList.add("selected");
                 } else {
                     choiceButton.classList.add("unselected");
@@ -958,12 +1296,9 @@ async function renderChoices(nodeContainer, path, variants, storyIndex, node, va
             // handle the choice selection
             choiceButton._clickButton = () => {
                 if (isCurrent) {
-                    path.push(choice.to);
-                    variants.push(variantIdx);
                     choiceButton.classList.add("selected");
-                    saveStateToURL(path, variants);
                     unselectChoices();
-                    renderPath(path, variants, storyIndex + 1);
+                    applyAndRender({ type: "choice", index: i });
                 }
             }
 
@@ -1001,37 +1336,8 @@ async function renderChoices(nodeContainer, path, variants, storyIndex, node, va
     }
 }
 
-async function renderNode(path, variants, storyIndex, node, variantIdx) {
-    // a skip only lasts for the node it was pressed during
-    skipMode = false;
-    // any pending auto-follow belongs to the node we are leaving
-    cancelAutoAdvance();
-
-    // flags this node raises become live as soon as it is on screen, ahead
-    // of its own choices being filtered
-    const variant = node.variants[variantIdx];
-    if (variant && variant.sets && variant.sets.length) {
-        const raised = variant.sets.filter(flag => !currentFlags.has(flag));
-        for (const flag of raised) currentFlags.add(flag);
-        if (raised.length) syncStateToURL();
-    }
-
-    // numeric variables are applied the same way; a plain number sets the
-    // value, a "+n"/"-n" string adjusts it
-    if (variant && variant.vars && Object.keys(variant.vars).length) {
-        let changed = false;
-        for (const [name, value] of Object.entries(variant.vars)) {
-            if (typeof value === "number") {
-                if (currentVars[name] !== value) changed = true;
-                currentVars[name] = value;
-            } else {
-                const delta = parseFloat(value);
-                currentVars[name] = (currentVars[name] ?? 0) + delta;
-                changed = true;
-            }
-        }
-        if (changed) syncStateToURL();
-    }
+async function renderNode(state, storyIndex, node) {
+    const variant = nodeVariant(node, state.variants[storyIndex]);
 
     // create the node container
     const nodeContainer = document.createElement("div");
@@ -1039,37 +1345,26 @@ async function renderNode(path, variants, storyIndex, node, variantIdx) {
     storyContainer.appendChild(nodeContainer);
 
     // create the text
-    await renderText(nodeContainer, node, variantIdx);
+    await renderText(nodeContainer, state, node, variant);
 
     // create the choices, if they exist
-    // because choices will progress the story, we need to pass the path and variants trackers
-    await renderChoices(nodeContainer, path, variants, storyIndex, node, variantIdx);
+    const isCurrent = storyIndex >= stepStates.length - 1;
+    await renderChoices(nodeContainer, state, storyIndex, node, variant, isCurrent);
 
     // ensure we have scrolled enough
     keepView();
 }
 
-function chooseVariant(node, index = null) {
-    // use the defined variant, or select one at random
-    if (Number.isInteger(index) && index >= 0 && index < node.variants.length) {
-        return index;
-    }
-    return Math.floor(Math.random() * node.variants.length);
-}
-
-// Render the story
-async function renderPath(path, variants, startIndex = null) {
+// draw every step from fromIndex on, each from its own snapshot
+async function renderForward(fromIndex) {
     const generation = renderGeneration;
-    currentPath = path;
-    currentVariants = variants;
     updateBackButton();
-    const fromIndex = startIndex ?? lastNode + 1;
-    for (let i = fromIndex; i < path.length; i++) {
+    for (let i = fromIndex; i < stepStates.length; i++) {
         // the view was cleared underneath us, stop appending
         if (generation !== renderGeneration) return;
 
-        const nodeName = path[i];
-        const node = storyData[nodeName];
+        const state = stepStates[i];
+        const node = storyData.nodes[state.path[i]];
 
         // node not implemented
         if (!node) {
@@ -1086,31 +1381,30 @@ async function renderPath(path, variants, startIndex = null) {
             continue;
         }
 
-        // fetch the current variant, and then render.
-        const variantIdx = chooseVariant(node, variants[i]);
-        await renderNode(path, variants, i, node, variantIdx);
-        lastNode = i;
+        await renderNode(state, i, node);
     }
 }
 
-function updatePOVColours(povState) {
-    if (!povState) { return }
-    for (const [key, value] of Object.entries(povState)) {
-        if (!povColours[key]) {
-            povColours[key] = value;
-        }
-    }
+// run a transition, publish the new state, draw whatever it entered
+async function applyAndRender(action) {
+    const result = applyTransition(currentState || emptyState(), action);
+    if (!result.steps.length) return;
+    const from = result.steps[0].index;
+    stepStates = stepStates.slice(0, from);
+    for (const step of result.steps) stepStates.push(step.state);
+    currentState = result.state;
+    saveStateToURL(result.state);
+    await renderForward(from);
 }
 
 // wipe every trace of the previous run so a re-render starts clean
 function clearView() {
     renderGeneration++;
-    lastNode = -1;
     storyHistory = [];
     skipMode = false;
     cancelAutoAdvance();
-    currentFlags = new Set();
-    currentVars = {};
+    stepStates = [];
+    currentState = emptyState();
     appliedImage = null;
     sceneImage.style.opacity = 0;
     sceneImage.style.backgroundImage = "";
@@ -1123,28 +1417,21 @@ function clearView() {
     effectOverlay.style.setProperty("--focus-size", "105%");
 }
 
-function pickStartNode() {
-    const startNodes = Object.entries(storyData).filter(([, v]) => v.start).map(([k]) => k);
-    if (!startNodes.length) {
-        error("No starting story nodes defined");
-    }
-    return startNodes[Math.floor(Math.random() * startNodes.length)];
-}
-
-function resetStory() {
+async function resetStory() {
     clearView();
     hideTitle();
     stopMusic();
 
+    const result = applyTransition(emptyState(), { type: "start" });
+
     // the first node gets its own history entry so Back walks
     // title -> first node -> choice -> ... instead of jumping from a
     // choice straight back to the title
-    const path = [pickStartNode()];
-    currentPath = path;
-    currentVariants = [];
-    saveStateToURL(path, []);
+    stepStates = [result.state];
+    currentState = result.state;
+    saveStateToURL(result.state);
 
-    return renderPath(path, []);
+    return renderForward(0);
 }
 
 // the browser Back button should walk the choices back
@@ -1152,16 +1439,18 @@ window.addEventListener("popstate", () => {
     if (!storyData) return;
     const state = loadStateFromURL();
     clearView();
-    currentFlags = new Set(state.flags);
-    currentVars = { ...state.vars };
-    updatePOVColours(state.povColours);
-    updateBackButton();
     if (!state.path.length) {
+        updateBackButton();
         showTitle();
         return;
     }
     hideTitle();
-    renderPath(state.path, state.variants).catch(e => error(e.message));
+    // replay from empty: same seed, same choices, so every intermediate
+    // state re-derives exactly as the original run produced it
+    stepStates = computeStepStates(state);
+    currentState = stepStates[stepStates.length - 1] || state;
+    updateBackButton();
+    renderForward(0).catch(e => error(e.message));
 });
 
 // ---- persistence helpers -------------------------------------------------
@@ -1186,10 +1475,6 @@ function writeStore(key, value) {
 
 const SAVES_KEY = "vn-template.saves";
 const SETTINGS_KEY = "vn-template.settings";
-
-// the arrays renderPath is walking, so the save panel can snapshot them
-let currentPath = [];
-let currentVariants = [];
 
 function motionReduced() {
     return settings.reduceMotion || reduceMotion.matches;
@@ -1231,6 +1516,25 @@ function renderHistoryList() {
     }
 }
 
+// restore a save (or a shared link) by replaying it from empty, the same
+// way popstate does
+function restoreState(restored) {
+    clearView();
+    if (!restored.path.length) {
+        updateBackButton();
+        showTitle();
+        return;
+    }
+    hideTitle();
+    const url = new URL(window.location);
+    url.searchParams.set("state", encodeState(restored));
+    window.history.pushState(null, "", url);
+    stepStates = computeStepStates(restored);
+    currentState = stepStates[stepStates.length - 1] || restored;
+    updateBackButton();
+    renderForward(0).catch(e => error(e.message));
+}
+
 function renderSaveSlots() {
     const wrap = document.getElementById("save-slots");
     wrap.textContent = "";
@@ -1251,15 +1555,11 @@ function renderSaveSlots() {
         saveBtn.type = "button";
         saveBtn.textContent = "Save";
         saveBtn.addEventListener("click", () => {
-            if (!storyData) return;
+            if (!storyData || !currentState.path.length) return;
             writeStore(SAVES_KEY, {
                 ...saves,
                 [i]: {
-                    path: [...currentPath],
-                    variants: [...currentVariants],
-                    povColours: { ...povColours },
-                    flags: [...currentFlags],
-                    vars: { ...currentVars },
+                    ...currentState,
                     savedAt: Date.now(),
                 },
             });
@@ -1275,16 +1575,7 @@ function renderSaveSlots() {
             const latest = readStore(SAVES_KEY, {})[i];
             if (!latest) return;
             closeAllPanels();
-            hideTitle();
-            clearView();
-            currentFlags = new Set(latest.flags || []);
-            currentVars = { ...(latest.vars || {}) };
-            updatePOVColours(latest.povColours);
-            const url = new URL(window.location);
-            url.searchParams.set("state", btoa(JSON.stringify(latest)));
-            window.history.pushState(null, "", url);
-            updateBackButton();
-            renderPath([...latest.path], [...latest.variants]).catch(e => error(e.message));
+            restoreState(sanitizeState(latest));
         });
         slot.appendChild(loadBtn);
 
@@ -1305,7 +1596,7 @@ function renderSaveSlots() {
 }
 
 function updateBackButton() {
-    document.getElementById("btn-back").disabled = currentPath.length <= 1;
+    document.getElementById("btn-back").disabled = !currentState || currentState.path.length <= 1;
 }
 
 function closeAllPanels() {
@@ -1470,7 +1761,6 @@ async function initStory() {
         await loadConfig();
         applyTheme();
         await loadColours();
-        updatePOVColours(config.povColours);
 
         document.body.style.background = config.backgroundColour || "#111";
         storyContainer.style.color = config.textColour || "#eee";
@@ -1488,22 +1778,25 @@ async function initStory() {
             throw new Error(`story.json returned ${res.status} - run python3 src/generate_story.py first`);
         }
         storyData = await res.json();
+        if (storyData.version !== 2 || !storyData.nodes) {
+            throw new Error("story.json is not version 2 - run python3 src/generate_story.py first");
+        }
 
         const state = loadStateFromURL();
-        const path = state["path"];
-
-        updatePOVColours(state["povColours"]);
-        currentFlags = new Set(state.flags);
-        currentVars = { ...state.vars };
 
         loadSettings();
         applySettings();
         initControls();
 
         hideStatus();
-        if (path.length) {
-            await renderPath(path, state["variants"]);
+        if (state.path.length) {
+            // a shared link or a reload: replay it so every step's state is
+            // rebuilt exactly, then draw the whole path
+            stepStates = computeStepStates(state);
+            currentState = stepStates[stepStates.length - 1] || state;
+            await renderForward(0);
         } else {
+            currentState = emptyState();
             // nothing in the url yet: the reader picks when to begin
             showTitle();
         }

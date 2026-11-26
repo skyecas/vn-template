@@ -75,20 +75,44 @@ Anything referenced by a choice that does not exist is reported as an invalid li
 ### Choices
 
 Each choice needs a `label` (what the reader sees) and a `to` (the node id it leads to).
-`if` is optional and gates the choice. Each entry in `if` is either a flag name (or `not flag`),
-or a numeric comparison like `score >= 3`; a list needs every entry to pass:
+`if` is optional and gates the choice; it accepts four spellings of the same grammar:
+
+**Level 1 - a list of terms** (every term must hold, so a list reads as `and`):
 
 ```yaml
-choices:
-    - label: Open the door
-      to: hallway
-      if: [has_key, saw_notice]
-    - label: Use the lockpick
-      to: hallway
-      if: [not alarmed, skill >= 5]
-    - label: Leave
-      to: exit
+if: [has_key, saw_notice]
 ```
+
+**Level 2 - a list of full expressions** (each entry parsed on its own):
+
+```yaml
+if:
+    - has_key
+    - skill >= 5 or not alarmed
+```
+
+**Level 3 - grouped counts** (simple terms per group, groups ANDed together):
+
+```yaml
+if:
+    all:
+        - has_key
+    any:
+        - skill >= 5
+        - luck >= 3
+```
+
+Level 3 group keys are `all:`, `any:`, `none:`, `at_least N:`, `at_most N:`, `exactly N:`
+and `between N and M:`; `N` must fit inside the group's entry list.
+
+**Level 4 - one expression string** - the only spelling `/if` and inline braces accept:
+
+```yaml
+if: has_key and (skill >= 5 or not alarmed)
+```
+
+Expressions combine flag names, `not`, comparisons (`>`, `>=`, `<`, `<=`, `==`, `!=`),
+`and` / `or`, parentheses, and visit counters (`visited(node_id)`, `visits(node_id) >= 2`).
 
 Flags only ever accumulate within a run: they come from the `sets:` of the nodes visited so
 far, so the browser Back button and the save slots restore exactly the flags that were live
@@ -110,7 +134,11 @@ The door stays shut.
 /endif
 ```
 
-Blocks nest, and a condition can be a flag, `not flag`, or a numeric comparison.
+Blocks nest, and `/if` takes one full level 4 expression: comparisons, `and`/`or`/`not`,
+parentheses and visit counters all combine in a single line (`/if score >= 3 and visited(vault)`).
+
+Conditions also work mid-sentence, picking a fragment instead of a whole line:
+`you are reading the {has_key: unlocked|locked} branch`.
 
 ## Variables
 
@@ -211,7 +239,7 @@ once your own media goes in.
 
 # Checks
 
-`python3 src/generate_story.py` runs 44 checks over the story. Failures (❌) stop generation and
+`python3 src/generate_story.py` runs 46 checks over the story. Failures (❌) stop generation and
 exit non-zero; warnings (⚠️) are printed but let the story through. CI runs the same generator,
 plus `ruff check` and `ruff format --check`, on every push and pull request, and deploys to
 GitHub Pages from `main`.

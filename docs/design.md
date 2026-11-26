@@ -200,6 +200,11 @@ You have {gold} coins.                            # substitution (strings too)
 - `// comment` at line start: stripped at build, never reaches `story.json`
 - Unknown markers remain a build error (`unknown_markers`), now checked on macro-expanded text
 
+**Branch shape for `if`/`alt`** (both token kinds store the same thing): a branch is an *array of line-entries*, i.e. exactly the shape of `lines` (each entry = one lexed line's token list). Two modes:
+
+- **block mode** - the line's sole token is an `if` built from `/if` ... `/else` ... `/endif`; `then`/`else` hold the lines between the markers (an `alt` never occurs here).
+- **inline mode** - the `{...}` brace appears mid-line and matches the shape below. Inline `if` is `{cond: then|else}` (a colon before the first pipe; no colon-before-pipe = not an if site): first pipe branch = one entry in `then`, second pipe branch = one entry in `else` (no second pipe = empty `else`; more than two pipes is `condition_syntax`). Inline `alt` (`{a|b}`, `{&a|b}`, `{~a|b}`): every pipe branch is one entry in `branches`. Braces matching no shape stay literal text.
+
 ### 1.7 Visibility rule for `/if`
 
 Effects inside conditional lines execute in source order during entry (state evolves as the walk proceeds). Display visibility is evaluated against the post-entry state. Divergence is possible only when a line effect mutates a var that a later `/if` in the *same node* depends on; documented, accepted (rare, and the validator can warn on it later).
@@ -379,6 +384,7 @@ NodeIR    : id, flags(start/end/revisit), title, chapter, next(+cond),
             choices_from, effects[EffectIR], presentation, variants[VariantIR]
 VariantIR : lines[list[TokenIR]], choices[ChoiceIR], effects[EffectIR]
 TokenIR   : Lit | Var | Marker(k,v) | If(cond, then, else) | Alt(mode, branches) | Fx(op,...)
+           # then/else/branches = arrays of line-entries (same shape as lines); see 1.6
 ChoiceIR  : label, to, cond(CondAST|None), effects, once, chance, fallback, call, return
 CondAST   : Truth | Not | And/Or(args) | Cmp(lhs,cmp,rhs) | Visits(id) | Count(min,max,args)
 EffectIR  : Set | Clear | Assign | Add | Roll | Unlock
