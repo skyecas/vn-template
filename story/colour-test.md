@@ -10,7 +10,7 @@ This is a test of different colours
 
 You can specify a colour for the entire story part
 
-/gold or specify a new colour per sentence, `\{name}`
+/gold or specify a new colour per sentence
 
 /green there can only be one colour per sentence (waht would gold-green even be?)
 

@@ -4,6 +4,8 @@ sets: flags-demo-seen
 choices:
     - label: How do I remove a flag I raised
       to: clear-test
+    - label: How do choices carry their own effects
+      to: effects-test
 choices_from: _shared/menu
 ---
 

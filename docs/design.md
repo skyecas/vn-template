@@ -75,6 +75,8 @@ choices:
 | `call` | bool | push current node onto `call` stack before following `to:` (1.9) |
 | `return` | bool | pop the call stack instead of navigating (early tunnel exit) |
 
+`chance` is a pure offer predicate over the state blob - seeded rng, node id, choice index, visit number - so render and replay derive the same roll without writing to state; a failed roll hides the choice exactly like a false `if`. `fallback` choices render as ordinary buttons while any non-fallback choice is visible; when only fallbacks remain the node offers no buttons and the first fallback is taken on advance.
+
 ### 1.4 Conditions - four levels, one grammar
 
 **Level 1 - the default; a list read top to bottom:**
@@ -348,7 +350,7 @@ Effect ops: `set`, `clear`, `assign`, `add`, `roll`, `unlock`.
 
 `applyTransition(state, action)` where action = choice click | implicit advance | return | restart:
 
-1. Consume the choice (`once` -> `used`; `chance` roll on seeded RNG)
+1. Consume the choice (`once` -> `used`; `chance` offer predicate from 1.3)
 2. Apply choice `effects`
 3. Flow: push (`call`) / pop (`return` / terminator) / append path / follow `next`
 4. Fresh entry only: pick variant (stored index wins), apply node `effects`, walk lines applying visible `fx` in source order, `visits++`

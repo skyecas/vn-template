@@ -7,6 +7,7 @@ Design contract: docs/design.md.
 
 from __future__ import annotations
 
+import itertools
 import re
 import sys
 from collections.abc import Callable, Iterator
@@ -66,6 +67,13 @@ IF_PATTERN = re.compile(r"^/if\s+(.+)$", re.IGNORECASE)
 ELSE_PATTERN = re.compile(r"^/else$", re.IGNORECASE)
 ENDIF_PATTERN = re.compile(r"^/endif$", re.IGNORECASE)
 
+# line-only effect markers (design 1.6): the whole line is one effect
+EFFECT_LINE_PREFIXES = ("/set ", "/clear ", "/roll ")
+EFFECT_LINE_STRIP = re.compile(
+    r"^/(?:set .+|clear [\w-]+|roll [\w-]+ \d+d\d+(?:[+-]\d+)?)$",
+    re.IGNORECASE,
+)
+
 # values that mean "turn it off" rather than naming a file
 CLEAR_VALUES = {"none", "reset", "clear"}
 
@@ -95,7 +103,7 @@ NODE_KEYS = {
     "choices",
     "choices_from",
 }
-CHOICE_KEYS = {"label", "to", "if"}
+CHOICE_KEYS = {"label", "to", "if", "effects", "once", "chance", "fallback"}
 
 
 def debug(msg: str) -> None:
@@ -416,10 +424,11 @@ def parse_effect(text: str) -> dict:
             "val": _effect_value(match.group(2)),
         }
     if match := _EFFECT_ADD.match(raw):
+        val = float(match.group(2).replace(" ", ""))
         return {
             "op": "add",
             "name": match.group(1),
-            "val": float(match.group(2).replace(" ", "")),
+            "val": int(val) if val.is_integer() else val,
         }
     if match := _EFFECT_SET.match(raw):
         return {"op": "set", "name": match.group(1)}
@@ -563,6 +572,19 @@ def lex_line(text: str) -> list[dict] | None:
     if match := MESSAGE_TITLE_PATTERN.match(stripped):
         return [_mk("messageTitle", match.group(1))]
 
+    # effect lines (design 1.6): /set, /clear and /roll run at entry
+    for prefix in EFFECT_LINE_PREFIXES:
+        if stripped.lower().startswith(prefix):
+            if prefix == "/set ":
+                body = stripped[len(prefix) :]
+            else:
+                body = f"{prefix[1:]}{stripped[len(prefix) :]}"
+            try:
+                effect = parse_effect(body)
+            except EffectError as e:
+                raise ValueError(str(e)) from e
+            return [{"t": "fx", **effect}]
+
     # text lines: known markers anywhere (placement is the checks' business)
     spans: list[tuple[int, int, dict]] = []
     spans += _find_spans(stripped, COLOUR_PATTERN, "colour")
@@ -648,7 +670,10 @@ def lex_body(body_lines: list[tuple[int, str]]) -> LexResult:
                 }
                 current().append([token])
             continue
-        tokens = lex_line(raw)
+        try:
+            tokens = lex_line(raw)
+        except ValueError as e:
+            raise ValueError(f"line {line_no}: {e}") from e
         if tokens:
             current().append(tokens)
 
@@ -678,6 +703,9 @@ class ChoiceIR:
     line: int = 1
     cond: dict | None = None
     effects: list[dict] = field(default_factory=list)
+    once: bool = False
+    chance: int = 100
+    fallback: bool = False
 
 
 @dataclass
@@ -769,7 +797,7 @@ def parse_markdown(content: str) -> tuple[dict[str, Any], str]:
 
 
 def parse_choices(raw: Any, filepath: Path, unknown: list[str]) -> list[ChoiceIR]:
-    """choices is a list of {label, to, if} entries (design 1.3)"""
+    """choices is a list of {label, to, if, effects, once, chance, fallback}"""
     if raw is None:
         return []
     if not isinstance(raw, list):
@@ -791,12 +819,38 @@ def parse_choices(raw: Any, filepath: Path, unknown: list[str]) -> list[ChoiceIR
             if key not in CHOICE_KEYS:
                 unknown.append(f"choice {i + 1} key {key!r}")
 
+        effects_raw = entry.get("effects") or []
+        if isinstance(effects_raw, str):
+            effects_raw = [effects_raw]
+        if not isinstance(effects_raw, list):
+            raise TypeError(f"choice {i + 1} effects must be a list")
+        effects = []
+        for effect_text in effects_raw:
+            if not isinstance(effect_text, str):
+                raise TypeError(f"choice {i + 1} effect entries must be strings")
+            try:
+                effects.append(parse_effect(effect_text))
+            except EffectError as e:
+                raise ValueError(f"{filepath}: choice {i + 1} {e}") from e
+
+        chance = entry.get("chance", 100)
+        if (
+            not isinstance(chance, int)
+            or isinstance(chance, bool)
+            or not 0 <= chance <= 100
+        ):
+            raise ValueError(f"choice {i + 1} chance must be an int 0-100")
+
         choices.append(
             ChoiceIR(
                 label=str(label),
                 target=str(target),
                 file=filepath,
                 cond=parse_condition(entry.get("if")),
+                effects=effects,
+                once=bool(entry.get("once", False)),
+                chance=chance,
+                fallback=bool(entry.get("fallback", False)),
             )
         )
 
@@ -922,7 +976,10 @@ def find_parts() -> dict[str, NodeIR]:
             raise ValueError(f"{f}: {e}") from e
 
         body_lines = list(enumerate(body.splitlines(), 1))
-        lexed = lex_body(body_lines)
+        try:
+            lexed = lex_body(body_lines)
+        except ValueError as e:
+            raise ValueError(f"{f}: {e}") from e
         variant = VariantIR(
             filepath=f,
             pathname=pathname,
@@ -984,6 +1041,34 @@ def variant_conds(variant: VariantIR) -> Iterator[dict]:
     yield from iter_conds(variant.lines)
 
 
+def iter_fx(lines: list) -> Iterator[dict]:
+    """every line-level fx token: block ifs, inline ifs, alt branches"""
+    for line in lines:
+        for token in line:
+            if token["t"] == "fx":
+                yield token
+            elif token["t"] == "if":
+                yield from iter_fx(token["then"])
+                yield from iter_fx(token["else"])
+            elif token["t"] == "alt":
+                for branch in token["branches"]:
+                    yield from iter_fx(branch)
+
+
+def iter_var_names(lines: list) -> Iterator[str]:
+    """every {name} substitution site in a token line-list"""
+    for line in lines:
+        for token in line:
+            if token["t"] == "var":
+                yield token["name"]
+            elif token["t"] == "if":
+                yield from iter_var_names(token["then"])
+                yield from iter_var_names(token["else"])
+            elif token["t"] == "alt":
+                for branch in token["branches"]:
+                    yield from iter_var_names(branch)
+
+
 def _effect_writes(parts: dict[str, NodeIR]) -> set[str]:
     """every name any effect writes (design: flags and vars unified)"""
     names: set[str] = set()
@@ -992,6 +1077,7 @@ def _effect_writes(parts: dict[str, NodeIR]) -> set[str]:
             for effect in [
                 *part.effects,
                 *(e for c in part.choices for e in c.effects),
+                *iter_fx(part.lines),
             ]:
                 if "name" in effect:
                     names.add(effect["name"])
@@ -1123,40 +1209,201 @@ def fully_conditional(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return nodes
 
 
-def unknown_flags(parts: dict[str, NodeIR]) -> list[VariantIR]:
-    """conditions gated on a name that no effect ever writes"""
+def _all_reads(cond: dict | None) -> set[str]:
+    """every var/flag name a condition reads, truth or comparison"""
+    return _truth_reads(cond) | _cmp_reads(cond)
+
+
+def unknown_names(parts: dict[str, NodeIR]) -> list[VariantIR]:
+    """conditions and {vars} reading a name no effect ever writes (design 4.1)"""
     writes = _effect_writes(parts)
     nodes = []
     for path in parts.values():
-        node_reads = _truth_reads(path.next_if)
+        node_reads = _all_reads(path.next_if)
         for part in path.variants:
             needed = set(node_reads)
             for cond in variant_conds(part):
-                needed |= _truth_reads(cond)
+                needed |= _all_reads(cond)
+            needed |= set(iter_var_names(part.lines))
             if needed - writes:
                 nodes.append(part)
                 debug(
-                    f"{part.pathname}: unknown flags: "
+                    f"{part.pathname}: unknown names: "
                     + ", ".join(sorted(needed - writes))
                 )
     return nodes
 
 
-def unknown_vars(parts: dict[str, NodeIR]) -> list[VariantIR]:
-    """conditions comparing a variable that no effect ever writes"""
-    writes = _effect_writes(parts)
+def _part_writes(part: VariantIR) -> set[str]:
+    """names one variant's effects write (frontmatter, choices, line fx)"""
+    names: set[str] = set()
+    for effect in [
+        *part.effects,
+        *(e for c in part.choices for e in c.effects),
+        *iter_fx(part.lines),
+    ]:
+        if "name" in effect:
+            names.add(effect["name"])
+        elif effect.get("op") == "roll":
+            names.add(effect["var"])
+    return names
+
+
+def set_but_never_read(parts: dict[str, NodeIR]) -> list[VariantIR]:
+    """names effects write but no condition or {var} ever reads (design 4.1)"""
+    reads: set[str] = set()
+    for path in parts.values():
+        reads |= _all_reads(path.next_if)
+        for part in path.variants:
+            for cond in variant_conds(part):
+                reads |= _all_reads(cond)
+            reads |= set(iter_var_names(part.lines))
+
     nodes = []
     for path in parts.values():
-        node_reads = _cmp_reads(path.next_if)
         for part in path.variants:
-            needed = set(node_reads)
-            for cond in variant_conds(part):
-                needed |= _cmp_reads(cond)
-            if needed - writes:
+            dead = _part_writes(part) - reads
+            if dead:
                 nodes.append(part)
                 debug(
-                    f"{part.pathname}: unknown variables: "
-                    + ", ".join(sorted(needed - writes))
+                    f"{part.pathname}: set but never read: " + ", ".join(sorted(dead))
+                )
+    return nodes
+
+
+def _cond_numeric(cond: dict | None) -> bool:
+    """whether a cond reads through comparisons or visits(): flag domain only"""
+    return any(node.get("op") in {"cmp", "visits"} for node in walk_cond(cond))
+
+
+def _eval_flag_cond(cond: dict, assignment: dict[str, bool]) -> bool:
+    """concrete eval over a flag assignment (names absent are stuck false)"""
+    op = cond.get("op")
+    if op == "truth":
+        return assignment.get(cond.get("name", ""), False)
+    if op == "not":
+        return not _eval_flag_cond(cond.get("arg") or {}, assignment)
+    if op == "and":
+        return all(_eval_flag_cond(arg, assignment) for arg in cond.get("args", []))
+    if op == "or":
+        return any(_eval_flag_cond(arg, assignment) for arg in cond.get("args", []))
+    if op == "count":
+        hits = sum(
+            1 for arg in cond.get("args", []) if _eval_flag_cond(arg, assignment)
+        )
+        high = cond.get("max")
+        return hits >= cond.get("min", 0) and (high is None or hits <= high)
+    return True  # bad/numeric conds never disprove satisfiability
+
+
+def _cond_satisfiable(cond: dict | None, maybe: set[str]) -> bool:
+    """can the cond ever be true? names outside maybe are stuck false"""
+    if not cond:
+        return True
+    if _cond_numeric(cond):
+        return True  # number domain: unknown_names owns unread names
+    names = sorted(_truth_reads(cond) & maybe)
+    if len(names) > 8:
+        return True  # bail out of big conjunctions rather than guess
+    for bits in itertools.product((False, True), repeat=len(names)):
+        if _eval_flag_cond(cond, dict(zip(names, bits))):
+            return True
+    return False
+
+
+def _set_sites(parts: dict[str, NodeIR]) -> list[tuple[str, list[dict]]]:
+    """(name, guard conds) per write site; empty guards = unconditional"""
+    sites: list[tuple[str, list[dict]]] = []
+
+    def take(effect: dict, guards: list[dict]) -> None:
+        if "name" in effect:
+            sites.append((effect["name"], guards))
+        elif effect.get("op") == "roll":
+            sites.append((effect["var"], guards))
+
+    def walk(lines: list, guards: list[dict]) -> None:
+        for line in lines:
+            for token in line:
+                if token["t"] == "fx":
+                    take(token, guards)
+                elif token["t"] == "if":
+                    walk(token["then"], guards + [token["cond"]])
+                    walk(
+                        token["else"],
+                        guards + [{"op": "not", "arg": token["cond"]}],
+                    )
+                elif token["t"] == "alt":
+                    for branch in token["branches"]:
+                        walk(branch, guards)
+
+    for path in parts.values():
+        for part in path.variants:
+            for effect in part.effects:
+                take(effect, [])
+            walk(part.lines, [])
+            for choice in part.choices:
+                for effect in choice.effects:
+                    take(effect, [choice.cond] if choice.cond else [])
+    return sites
+
+
+def _settable_names(parts: dict[str, NodeIR]) -> set[str]:
+    """names that can actually become true: monotone fixpoint over guards"""
+    maybe: set[str] = set()
+    sites = _set_sites(parts)
+    changed = True
+    while changed:
+        changed = False
+        for name, guards in sites:
+            if name in maybe:
+                continue
+            if all(_cond_satisfiable(guard, maybe) for guard in guards):
+                maybe.add(name)
+                changed = True
+    return maybe
+
+
+def satisfiability(parts: dict[str, NodeIR]) -> list[VariantIR]:
+    """never-true conditions in the flag domain (design 4.1)"""
+    writes = _effect_writes(parts)
+    maybe = _settable_names(parts)
+    nodes = []
+    for path in parts.values():
+        node_conds = [path.next_if] if path.next_if else []
+        for part in path.variants:
+            problem = None
+            for cond in [*node_conds, *variant_conds(part)]:
+                reads = _truth_reads(cond)
+                if not reads or not reads <= writes:
+                    continue  # no flag reads, or unknown_names' domain
+                if not _cond_satisfiable(cond, maybe):
+                    problem = "condition can never be true: " + ", ".join(sorted(reads))
+                    break
+            if problem:
+                nodes.append(part)
+                debug(f"{part.pathname}: {problem}")
+    return nodes
+
+
+def chance_only_exit(parts: dict[str, NodeIR]) -> list[VariantIR]:
+    """chance on the only statically visible exit (design 4.1)"""
+    nodes = []
+    for path in parts.values():
+        if path.is_end or (path.next and not path.next_if):
+            continue  # endings and unconditional next never need a choice
+        for part in path.variants:
+            if not part.choices:
+                continue
+            cond_free = [choice for choice in part.choices if choice.cond is None]
+            if (
+                len(cond_free) == 1
+                and cond_free[0].chance < 100
+                and not any(choice.fallback for choice in part.choices)
+            ):
+                nodes.append(part)
+                debug(
+                    f"{part.pathname}: chance {cond_free[0].chance} on the only "
+                    f"visible exit {cond_free[0].label!r}"
                 )
     return nodes
 
@@ -1462,6 +1709,7 @@ def unknown_markers(parts: dict[str, NodeIR]) -> list[VariantIR]:
                     SFX_PATTERN,
                     BACKGROUND_EFFECTS_PATTERN,
                     CONDITIONAL_STRIP_PATTERN,
+                    EFFECT_LINE_STRIP,
                 ]:
                     stripped = regex.sub("", stripped)
 
@@ -1706,8 +1954,15 @@ def emit_variant(variant: VariantIR) -> dict[str, Any]:
     out: dict[str, Any] = {
         "lines": variant.lines,
         "choices": [
-            {"label": choice.label, "to": choice.target}
+            {
+                "label": choice.label,
+                "to": choice.target,
+                "once": choice.once,
+                "chance": choice.chance,
+                "fallback": choice.fallback,
+            }
             | ({"if": choice.cond} if choice.cond else {})
+            | ({"effects": choice.effects} if choice.effects else {})
             for choice in variant.choices
         ],
     }
@@ -1803,6 +2058,18 @@ class StoryCheck:
 
 
 def main() -> int:
+    sim_walks = 0
+    if "--sim" in sys.argv:
+        position = sys.argv.index("--sim")
+        try:
+            sim_walks = int(sys.argv[position + 1])
+        except (IndexError, ValueError):
+            failure("--sim needs a walk count, e.g. --sim 200")
+            return 1
+        if sim_walks < 1:
+            failure("--sim needs a walk count of at least 1")
+            return 1
+
     print("Searching for story parts")
     try:
         parts = find_parts()
@@ -1830,8 +2097,12 @@ def main() -> int:
         StoryCheck(invalid_links, "parts with missing or invalid links", False),
         StoryCheck(dead_ends, "parts with no choices"),
         StoryCheck(fully_conditional, "parts where every choice needs a flag", False),
-        StoryCheck(unknown_flags, "parts gating on a flag nothing sets", False),
-        StoryCheck(unknown_vars, "parts reading a variable nothing sets", False),
+        StoryCheck(unknown_names, "parts reading a name nothing sets", False),
+        StoryCheck(set_but_never_read, "parts setting a name nothing reads", False),
+        StoryCheck(satisfiability, "parts with never-true conditions"),
+        StoryCheck(
+            chance_only_exit, "parts whose only visible exit rolls chance", False
+        ),
         StoryCheck(condition_syntax, "parts with unparseable conditions"),
         StoryCheck(conditional_blocks, "parts with unbalanced /if blocks"),
         StoryCheck(continuing_ends, "ending parts contain choices"),
@@ -1923,6 +2194,11 @@ def main() -> int:
     json = generate_json(parts)
     story_path = Path("src/story.json")
     story_path.write_text(dumps(json, indent=2))
+    if sim_walks:
+        from simulator import load_artifact, run_sim
+
+        load_artifact(story_path)
+        run_sim(sim_walks)
     return 0
 
 

@@ -12,6 +12,20 @@ python3 src/generate_story.py
 This checks the whole story for broken links, missing starts/ends, unknown markers and the like,
 then writes `src/story.json`. It must be run from the repo root (it reads `story/` and `src/named_colours`).
 
+Two analysis tools run on the same compiled artifact:
+
+```
+python3 src/generate_story.py --sim 200   # seeded random walks over the story
+python3 src/play.py                        # play it in the terminal
+```
+
+`--sim N` walks the story N times (walk `i` uses story seed `i`) and reports which nodes no walk
+reached, how runs ended or where they got stuck, and how often each choice was picked. `play.py`
+plays interactively: a number picks a choice, `back` undoes, `state` dumps the save, and
+`save [file]` / `load [file]` write and restore one - loading replays the path exactly like a
+shared link. Both run on the same simulator as the browser, so a roll that comes up 15 in the
+terminal comes up 15 in the browser.
+
 Serve the site over HTTP - browsers block `fetch()` on `file://`:
 
 ```
@@ -118,6 +132,21 @@ if: has_key and (skill >= 5 or not alarmed)
 Expressions combine flag names, `not`, comparisons (`>`, `>=`, `<`, `<=`, `==`, `!=`),
 `and` / `or`, parentheses, and visit counters (`visited(node_id)`, `visits(node_id) >= 2`).
 
+Four optional keys on a choice shape how it behaves:
+
+- `effects:` - a list of effects run the moment the choice is picked, before the story moves on,
+  written the same way as front matter effects (`coins +1`, `took_coin`, `player = "Skye"`)
+- `once: true` - the pick is consumed and recorded in the save as `node:variant:index`, so the
+  choice is never offered again; Back still restores the moment before the click
+- `chance: 25` - the choice is offered only when the seeded roll succeeds; a failed roll hides
+  it exactly like a false `if`, and the roll reads the save's seed, so the same link always
+  reveals the same way
+- `fallback: true` - an ordinary button while any other choice is visible; when only fallbacks
+  remain the page shows no buttons and the first one is taken on advance
+
+See `story/effects-test.md` for `effects` + `once` and `story/chance-test.md` for `chance` +
+`fallback`.
+
 ### Shared menus
 
 A menu written once can ship on every page with `choices_from`, instead of copying the
@@ -216,6 +245,14 @@ through comparisons (`score >= 3`, with `>`, `>=`, `<`, `<=`, `==`, `!=`). They 
 Back, saves and the URL like flags do. `clear:` in the front matter deletes a name - flag or
 var - the moment its page is entered, before any line or choice is built.
 
+Effects are not front-matter-only: `/set name`, `/clear name` and `/roll luck 1d20` are lines,
+so an effect can sit right where it happens in the prose. `/roll` writes the total into the
+named variable and `{luck}` reads it back on the next line. See `story/line-effects-test.md`.
+
+Strings live in the same `vars` map: quote them in the front matter (`home: "Alder Street"`),
+write them with an effect (`player = "Skye"`), compare with `==` / `!=` only, and substitute
+them anywhere with `{player}`. See `story/string-test.md`.
+
 ## Markers
 
 Colours are either a name from `src/named_colours` or a hex value like `#ef0`.
@@ -280,6 +317,10 @@ The toolbar at the top of the page gives you:
 
 `Esc` closes any open panel.
 
+Append `?debug` to any URL for a debug overlay: the current node and variant, the full state
+dump, and a per-choice table showing which choices are visible and exactly why a hidden one
+failed - its condition, its chance roll, or a `once` already spent.
+
 While reading you can also:
 
 - **Click anywhere** (or press `Space` / `Enter`) - finish the current line's reveal, or, when
@@ -299,7 +340,7 @@ once your own media goes in.
 
 # Checks
 
-`python3 src/generate_story.py` runs 46 checks over the story. Failures (❌) stop generation and
+`python3 src/generate_story.py` runs 48 checks over the story. Failures (❌) stop generation and
 exit non-zero; warnings (⚠️) are printed but let the story through. CI runs the same generator,
 plus `ruff check` and `ruff format --check`, on every push and pull request, and deploys to
 GitHub Pages from `main`.

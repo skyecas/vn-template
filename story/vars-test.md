@@ -6,6 +6,8 @@ choices:
     - label: A choice that needs a score of 3 or more
       to: back-step-1
       if: score >= 3
+    - label: How do I change a variable mid-sentence
+      to: line-effects-test
 choices_from: _shared/menu
 ---
 

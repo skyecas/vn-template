@@ -296,6 +296,11 @@ function walkTokens(tokens, state, nodeId, visitNumber, lineIndex, onToken) {
             case "mk":
                 onToken(token);
                 break;
+            case "fx":
+                // entry-time line effect: applied in source order, never drawn
+                // (design 2.3 step 4; render uses renderLineList, not this walk)
+                applyEffect(token, state);
+                break;
             case "if": {
                 const branch = evalCond(token.cond, state) ? token.then : token.else;
                 for (const entry of branch) {
@@ -352,10 +357,34 @@ function assignVisiblePovs(state, node, variant, nodeId) {
 
 // the choices on screen right now: gated by conditions, revisit, and by a
 // live `next` (an auto-continuing node never surfaces its choices)
+// the stored variant index a state resolved to, mirroring nodeVariant
+function variantIndexFor(state, node, index) {
+    const stored = state.variants[index];
+    return Number.isInteger(stored) && stored >= 0 && stored < node.variants.length ? stored : 0;
+}
+
+// once: consumed choices live here as node:variant:index (design 1.3)
+function usedKey(nodeId, variantIndex, choiceIndex) {
+    return `${nodeId}:${variantIndex}:${choiceIndex}`;
+}
+
+// chance is a pure offer predicate over the state blob: same seed, node,
+// choice index and visit number = same roll, with no write to state (1.3)
+function chanceOffered(state, nodeId, choiceIndex, chance) {
+    if (chance === undefined || chance >= 100) return true;
+    if (chance <= 0) return false;
+    const visit = state.visits[nodeId] || 0;
+    return hash32(state.rng.seed, nodeId, choiceIndex, visit) % 100 < chance;
+}
+
 function visibleChoices(state, node, variant, path, index) {
     if (liveNext(state, node)) return [];
-    return (variant.choices || []).filter(choice => {
+    const nodeId = path[index];
+    const variantIndex = variantIndexFor(state, node, index);
+    return (variant.choices || []).filter((choice, choiceIndex) => {
+        if (choice.once && state.used.includes(usedKey(nodeId, variantIndex, choiceIndex))) return false;
         if (choice.if && !evalCond(choice.if, state)) return false;
+        if (!chanceOffered(state, nodeId, choiceIndex, choice.chance)) return false;
         const target = storyData.nodes[choice.to];
         if (!target) return true; // unimplemented, sure, let it show
         const alreadyVisited = path.slice(0, index + 1).includes(choice.to);
@@ -447,12 +476,22 @@ function applyTransition(state, action) {
         const visible = visibleChoices(next, node, variant, next.path, next.path.length - 1);
         let choice = null;
         if (action.type === "advance") {
-            if (visible.length === 1) choice = visible[0];
+            // a lone visible choice follows itself; when only fallbacks are
+            // visible the first one is taken (design 1.3)
+            const real = visible.filter(candidate => !candidate.fallback);
+            if (!real.length && visible.length) choice = visible[0];
+            else if (visible.length === 1) choice = visible[0];
         } else {
             choice = visible[action.index];
         }
         if (!choice) return { state: next, steps: [] };
 
+        // consume before effects, per the transition order (design 2.3)
+        if (choice.once) {
+            const choiceIndex = variant.choices.indexOf(choice);
+            const key = usedKey(nodeId, variantIndexFor(next, node, next.path.length - 1), choiceIndex);
+            if (!next.used.includes(key)) next.used.push(key);
+        }
         if (choice.effects) {
             for (const effect of choice.effects) applyEffect(effect, next);
         }
@@ -1073,6 +1112,8 @@ async function renderLineTokens(entry, ctx, lineIndex) {
         await runMarker(entry[0], ctx);
         return;
     }
+    // line effects already ran at entry; they never draw
+    if (entry.length === 1 && entry[0].t === "fx") return;
 
     const marks = newMarks();
     collectTokens([entry], ctx, lineIndex, marks);
@@ -1261,6 +1302,11 @@ async function renderChoices(nodeContainer, state, storyIndex, node, variant, is
     // the choices this step's state allows
     const choices = visibleChoices(state, node, variant, state.path, storyIndex);
 
+    // when only fallbacks remain the node offers no buttons; advance takes
+    // the first one (design 1.3)
+    const fallbackOnly = choices.length > 0 && choices.every(choice => choice.fallback);
+    const shown = fallbackOnly ? [] : choices;
+
     // an ending, or a node with no live exit, offers a restart instead; a
     // node about to follow `next` shows nothing and continues on advance
     const isEnd = node.end || (choices.length === 0 && !liveNext(state, node));
@@ -1273,8 +1319,8 @@ async function renderChoices(nodeContainer, state, storyIndex, node, variant, is
     }
     // otherwise, show the choices
     else {
-        for (let i = 0; i < choices.length; i++) {
-            const choice = choices[i];
+        for (let i = 0; i < shown.length; i++) {
+            const choice = shown[i];
             const choiceButton = document.createElement("button");
             choiceButton.type = "button";
             choiceButton.className = "story-choice";
@@ -1322,17 +1368,26 @@ async function renderChoices(nodeContainer, state, storyIndex, node, variant, is
             button.disabled = false;
         }
 
-        // a linear node can follow its only choice on its own, so a story
-        // reads hands-off; any reader input cancels it first
         const delay = Number(config.autoAdvance) || 0;
-        const live = activeChoiceButtons();
-        if (delay > 0 && live.length === 1) {
+        if (fallbackOnly) {
+            // nothing to click: the first fallback picks itself (design 1.3)
             cancelAutoAdvance();
             autoAdvanceTimer = setTimeout(() => {
                 autoAdvanceTimer = null;
-                const now = activeChoiceButtons();
-                if (now.length === 1) now[0].click();
+                applyAndRender({ type: "advance" });
             }, delay);
+        } else {
+            // a linear node can follow its only choice on its own, so a story
+            // reads hands-off; any reader input cancels it first
+            const live = activeChoiceButtons();
+            if (delay > 0 && live.length === 1) {
+                cancelAutoAdvance();
+                autoAdvanceTimer = setTimeout(() => {
+                    autoAdvanceTimer = null;
+                    const now = activeChoiceButtons();
+                    if (now.length === 1) now[0].click();
+                }, delay);
+            }
         }
     }
 }
@@ -1384,6 +1439,7 @@ async function renderForward(fromIndex) {
 
         await renderNode(state, i, node);
     }
+    refreshDebug();
 }
 
 // run a transition, publish the new state, draw whatever it entered
@@ -1416,6 +1472,7 @@ function clearView() {
     storyContainer.style.color = config.textColour || "#eee";
     weatherCanvas.className = "";
     effectOverlay.style.setProperty("--focus-size", "105%");
+    refreshDebug();
 }
 
 async function resetStory() {
@@ -1756,6 +1813,95 @@ function initControls() {
 const settings = { textSpeed: null, reduceMotion: false, highContrast: false, volume: 0.7, muted: false };
 
 // Start the rendering of the story plz
+// ---- ?debug overlay (design 4.2) ------------------------------------------
+// node/variant, the full state dump and every choice with the reason it is
+// hidden; on only when the URL carries ?debug
+
+let debugPanel = null;
+
+function initDebug() {
+    if (!new URLSearchParams(window.location.search).has("debug")) return;
+    debugPanel = document.createElement("pre");
+    debugPanel.id = "debug-overlay";
+    debugPanel.style.cssText =
+        "position:fixed;right:8px;bottom:8px;max-width:46%;max-height:60%;overflow:auto;" +
+        "margin:0;padding:8px 10px;background:rgba(0,0,0,.85);color:#9f9;" +
+        "font:11px/1.45 monospace;z-index:99;pointer-events:none;white-space:pre-wrap;";
+    document.body.appendChild(debugPanel);
+}
+
+// the first sub-expression that made a false cond false, as text
+function condWhy(cond, state) {
+    if (!cond || evalCond(cond, state)) return "";
+    switch (cond.op) {
+        case "truth": return cond.name;
+        case "cmp": return `${JSON.stringify(cond.lhs)} ${cond.cmp} ${JSON.stringify(cond.rhs)}`;
+        case "not": return `not (${condWhy(cond.arg, state) || "?"})`;
+        case "and":
+            return cond.args.map(arg => condWhy(arg, state)).filter(Boolean).join(" and ") || "and";
+        case "or":
+            return cond.args.map(arg => condWhy(arg, state)).filter(Boolean).join(" or ") || "or";
+        case "count": return `count ${cond.min}..${cond.max}`;
+        case "visits": return `visits(${cond.id})`;
+        default: return "condition";
+    }
+}
+
+// why one choice is hidden; null = visible (mirrors visibleChoices' order)
+function choiceFailure(state, node, choice, choiceIndex) {
+    if (liveNext(state, node)) return "suppressed by next";
+    const index = state.path.length - 1;
+    const nodeId = state.path[index];
+    const variantIndex = variantIndexFor(state, node, index);
+    if (choice.once && state.used.includes(usedKey(nodeId, variantIndex, choiceIndex))) {
+        return "once: already used";
+    }
+    if (choice.if) {
+        const why = condWhy(choice.if, state);
+        if (why) return `if: ${why}`;
+    }
+    if (!chanceOffered(state, nodeId, choiceIndex, choice.chance)) {
+        return `chance ${choice.chance}: rolled against`;
+    }
+    const target = storyData.nodes[choice.to];
+    if (target && state.path.slice(0, index + 1).includes(choice.to) && !target.revisit) {
+        return "revisit: already visited";
+    }
+    return null;
+}
+
+function refreshDebug() {
+    if (!debugPanel) return;
+    const state = currentState || emptyState();
+    const nodeId = state.path[state.path.length - 1];
+    const node = nodeId ? storyData.nodes[nodeId] : null;
+    const lines = [];
+    const variantIndex = state.variants[state.variants.length - 1];
+    lines.push(`node: ${nodeId ?? "-"}${node ? ` (variant ${variantIndex ?? "-"})` : ""}`);
+    lines.push(`path: ${state.path.join(" > ") || "-"}`);
+    lines.push(`vars: ${JSON.stringify(state.vars)}`);
+    lines.push(`visits: ${JSON.stringify(state.visits)}`);
+    lines.push(`used: ${JSON.stringify(state.used)}`);
+    lines.push(`rng: seed ${state.rng.seed} n ${state.rng.n}`);
+    if (node) {
+        const variant = nodeVariant(node, variantIndex);
+        lines.push("choices:");
+        (variant.choices || []).forEach((choice, i) => {
+            const failure = choiceFailure(state, node, choice, i);
+            const flags = [
+                choice.once ? "once" : "",
+                choice.chance !== undefined && choice.chance < 100 ? `chance ${choice.chance}` : "",
+                choice.fallback ? "fallback" : "",
+            ].filter(Boolean).join(",");
+            lines.push(
+                `  ${failure ? "[x]" : "[ ]"} ${choice.label} -> ${choice.to}` +
+                `${flags ? ` (${flags})` : ""}${failure ? `  ${failure}` : ""}`,
+            );
+        });
+    }
+    debugPanel.textContent = lines.join("\n");
+}
+
 async function initStory() {
     showStatus("Loading story…");
     try {
@@ -1784,6 +1930,7 @@ async function initStory() {
         }
 
         const state = loadStateFromURL();
+        initDebug();
 
         loadSettings();
         applySettings();
@@ -1802,6 +1949,7 @@ async function initStory() {
             showTitle();
         }
         updateBackButton();
+        refreshDebug();
     } catch (e) {
         console.error(e);
         showStatus(`Could not start the story: ${e.message}`, () => window.location.reload());
