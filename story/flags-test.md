@@ -6,6 +6,8 @@ choices:
       to: clear-test
     - label: How do choices carry their own effects
       to: effects-test
+    - label: How do I write a passage once and reuse it
+      to: include-test
 choices_from: _shared/menu
 ---
 

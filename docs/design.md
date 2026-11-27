@@ -234,7 +234,10 @@ The gate swings open.
 - Paths are relative to `story/`, minus `.md`; `_` prefix required (subdirs are otherwise variants)
 - `params:` binds positional args (`{{_macros/greet Lady Alice}}` - quoted string args supported); `{who}` substitutes during expansion
 - **Compile-time expansion** before validation, so reachability/`unknown_markers`/condition checks see real text
-- Recursion: depth limit + cycle check (`macro_recursion` error)
+- **File shapes:** a macro file may carry frontmatter with `params: [names]`, then its body; an include's frontmatter is ignored entirely and only its body splices in
+- **Substitution:** each declared param substitutes `{name}` everywhere in the macro body (prose and markers); calling with the wrong number of arguments is a `macro_params` error; a `{name}` that is not a declared param stays literal and lexes as a variable
+- **Comments:** `//` at line start (indentation allowed) strips the whole line; applied after expansion (macro bodies may carry comments) and before lexing, so it never reaches `story.json`
+- Recursion: depth limit 16 + cycle check (`macro_recursion` error); a `{{...}}` path that is missing or not `_`-prefixed is an `include_missing` error
 - Diagnostics carry the origin chain: `story/_macros/greet.md:2 (via gate.md:12): unknown marker /pv`
 - `choices_from: _shared/menu` merges a file's frontmatter `choices:` (body includes cannot reach frontmatter; this is the shared-menu mechanism)
 - Merge semantics: only the file's `choices:` list is merged (its other frontmatter keys are ignored); the node's own choices come first and the merged choices follow; the merged file may itself carry `choices_from`, which chains with a cycle check; a missing file, a file with no `choices:`, or duplicate labels across the merged whole are build errors (P2's `choices_from_clash` will name the last one)
@@ -260,8 +263,11 @@ He finds nothing.
 ```
 
 - Flow: click -> push -> sub-scene runs normally (edges, `next`, effects, choices) -> terminator text reveals -> advance (or `autoAdvance`) performs the pop -> caller's choices offer again
-- **Early exit:** choice-level `return: true` (a reader decision, not bookkeeping)
+- **Push:** `call: true` requires `to:`; the stack record is `{id, variant}` - the caller's id and its picked variant at push time; the sub-node then enters fresh (front matter, variant pick, visits all run)
+- **Pop:** on an `end:` node with a non-empty call stack, advance pops instead of offering restart; the caller is appended to the path as a *resume step* (`state.resume[i] = true`) that renders **its choices only** - no text, no effects, no variant re-pick, no visit increment, no rng draws (the transcript keeps the tunnel content above it)
+- **Early exit:** choice-level `return: true` (a reader decision, not bookkeeping); it runs its own `effects` first, then pops one level, and may omit `to:`; an empty stack means no navigation (`orphan_return` warns at build)
 - **Resume rule:** a return transition does not re-apply the caller's effects and does not re-pick its variant (only fresh-entry transitions do); `gold +1` on the caller cannot double-fire
+- **State:** `call` is a stack of `{id, variant}` records in the state blob; `resume` is a boolean array parallel to `path`; shared links and saves replay resume steps by popping (`computeStepStates`)
 - **Nested tunnels:** pop one level per terminator; `call` is a stack in the state blob
 - **Gallery:** an `end:` node records a finishing only when the stack was empty
 - **Rendering intent:** tunnel content appends to the log transcript-style; after the pop, the caller's choices render at the bottom (refine in P2; no DOM snapshotting)
@@ -420,6 +426,8 @@ All **44 existing checks migrate** to the IR (conditions are now ASTs, not regex
 | `orphan_return` | warning | `return` choice in a node no `call` targets |
 | `choices_from_clash` | error | duplicate labels after merging |
 | `macro_recursion` | error | macro cycle / depth overflow |
+| `include_missing` | error | `{{...}}` include/macro path missing or not `_`-prefixed |
+| `macro_params` | error | macro called with the wrong number of arguments |
 | `next_targets` | error | `next`/`next if` pointing at missing nodes (folded into `invalid_links`) |
 | `contrast` | warning | authored `colour`/`background` pairs below WCAG AA ratio (computed from `named_colours` luminance) |
 
@@ -430,10 +438,11 @@ Final count lands in the README at implementation time.
 | Tool | Output |
 |---|---|
 | `--sim N` | seeded random walks over the compiled artifact: unreached nodes, ending distribution, dead-end walks, choice pick heat |
-| `--dot` | DOT/Mermaid graph export |
+| `--dot` | `story.dot` (Graphviz) + `story.mmd` (Mermaid): node graph with choice edges, `next` edges dashed, end nodes boxed |
 | `--report` | `report.html`: sim stats, branch heat, **asset weight per route**, reading time, set-but-never-read, contrast failures, and for every unsatisfiable/locked condition an **example state that would unlock it** |
 | `play.py` | interactive terminal player over the same artifact: numbered choices, `back`, `state`, `save`/`load`; shares the simulator with `--sim` |
-| `--watch` | file watcher -> rebuild -> live-reload the browser |
+| `--watch` | file watcher -> rebuild -> live-reload: a small built-in server serves `src/` with an injected reload socket, so the open browser refreshes on every change |
+| `--github` | `::error file=...,line=...::` / `::warning ...::` annotations for inline PR display (one per failing part) |
 | `?debug` (runtime) | overlay: current node/variant, full state dump, per-choice condition results **with the reason a hidden choice failed** |
 
 ### 4.3 Runtime meta (P3)

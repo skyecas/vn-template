@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import itertools
 import re
+import shlex
 import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -477,9 +478,10 @@ def _find_spans(
 def lex_content(text: str) -> list[dict]:
     """split a line's text into lit / var / if / alt tokens (design 1.6)"""
     tokens: list[dict] = []
-    pos = 0
+    scan = 0  # where the next construct is looked for
+    emitted = 0  # text before this point has been emitted already
     while True:
-        open_at = text.find("{", pos)
+        open_at = text.find("{", scan)
         if open_at == -1:
             break
         close_at = text.find("}", open_at + 1)
@@ -488,15 +490,16 @@ def lex_content(text: str) -> list[dict]:
         inner = text[open_at + 1 : close_at]
         parsed = _lex_brace(inner)
         if parsed is None:
-            # not a construct we know: literal braces, keep scanning past them
-            pos = open_at + 1
+            # not a construct we know: literal brace, keep scanning past it
+            # (the text before it is still pending, design 1.6)
+            scan = open_at + 1
             continue
-        if text[pos:open_at]:
-            tokens.append({"t": "lit", "v": text[pos:open_at]})
+        if text[emitted:open_at]:
+            tokens.append({"t": "lit", "v": text[emitted:open_at]})
         tokens.append(parsed)
-        pos = close_at + 1
-    if text[pos:]:
-        tokens.append({"t": "lit", "v": text[pos:]})
+        emitted = scan = close_at + 1
+    if text[emitted:]:
+        tokens.append({"t": "lit", "v": text[emitted:]})
     return tokens
 
 
@@ -619,8 +622,16 @@ def lex_line(text: str) -> list[dict] | None:
     return tokens or None
 
 
-def lex_body(body_lines: list[tuple[int, str]]) -> LexResult:
-    """whole body: /if blocks nest into if tokens, everything else in order"""
+def lex_body(
+    body_lines: list[tuple[int, str]],
+    node_file: Path | None = None,
+    origins: list[Path] | None = None,
+) -> LexResult:
+    """whole body: /if blocks nest into if tokens, everything else in order
+
+    line numbers are the origin lines of whichever file each line came from
+    (design 1.8), so a bad line inside an include names that file
+    """
     lines: list[list[dict]] = []
     stack: list[dict] = []
     error: str | None = None
@@ -632,7 +643,7 @@ def lex_body(body_lines: list[tuple[int, str]]) -> LexResult:
             else (stack[-1]["then"] if stack else lines)
         )
 
-    for line_no, raw in body_lines:
+    for index, (line_no, raw) in enumerate(body_lines):
         stripped = raw.strip()
         if match := IF_PATTERN.match(stripped):
             try:
@@ -673,6 +684,11 @@ def lex_body(body_lines: list[tuple[int, str]]) -> LexResult:
         try:
             tokens = lex_line(raw)
         except ValueError as e:
+            origin = origins[index] if origins else None
+            if node_file and origin and origin != node_file:
+                # the line was spliced in from elsewhere: name the real file
+                # and line, and where it was included from (design 1.8)
+                raise ValueError(f"{origin}:{line_no} (via {node_file}): {e}") from e
             raise ValueError(f"line {line_no}: {e}") from e
         if tokens:
             current().append(tokens)
@@ -688,6 +704,111 @@ def lex_body(body_lines: list[tuple[int, str]]) -> LexResult:
         }
         current().append([token])
     return LexResult(lines=lines, block_error=error)
+
+
+# ---------------------------------------------------------------------------
+# includes and macros (design 1.8): {{path}} splices at build, // strips
+# ---------------------------------------------------------------------------
+
+INCLUDE_PATTERN = re.compile(r"^\{\{\s*([^\s}]+)(.*?)\}\}$")
+MACRO_DEPTH_LIMIT = 16
+
+
+def expand_body(
+    body_lines: list[tuple[int, str]],
+    filepath: Path,
+    stack: tuple[Path, ...] = (),
+    depth: int = 0,
+) -> tuple[list[tuple[int, str]], list[Path], list[tuple[str, str]]]:
+    """splice {{include/macro}} lines and drop // comments (design 1.6, 1.8)
+
+    Returns (origin lines, one origin file per line, expansion errors as
+    (kind, message) pairs). A failed line stays literal so later checks still
+    see text to report on; the error itself fails the build.
+    """
+    out_lines: list[tuple[int, str]] = []
+    out_origins: list[Path] = []
+    errors: list[tuple[str, str]] = []
+
+    for line_no, raw in body_lines:
+        if raw.strip().startswith("//"):
+            continue  # comments never reach story.json (design 1.6)
+        match = INCLUDE_PATTERN.match(raw.strip())
+        if not match:
+            out_lines.append((line_no, raw))
+            out_origins.append(filepath)
+            continue
+
+        ref, args_text = match.group(1), match.group(2).strip()
+        where = f"{filepath}:{line_no}"
+        shown = raw.strip()
+        target = Path("story") / (ref if ref.endswith(".md") else f"{ref}.md")
+        if not ref.startswith("_") or not target.is_file():
+            errors.append(
+                (
+                    "include_missing",
+                    f"{where}: {shown} is not an existing '_' file under story/",
+                )
+            )
+            out_lines.append((line_no, raw))
+            out_origins.append(filepath)
+            continue
+        if target in stack:
+            errors.append(("macro_recursion", f"{where}: {shown} expands in a cycle"))
+            out_lines.append((line_no, raw))
+            out_origins.append(filepath)
+            continue
+        if depth >= MACRO_DEPTH_LIMIT:
+            errors.append(
+                (
+                    "macro_recursion",
+                    f"{where}: {shown} nests past depth {MACRO_DEPTH_LIMIT}",
+                )
+            )
+            out_lines.append((line_no, raw))
+            out_origins.append(filepath)
+            continue
+
+        try:
+            metadata, inc_body = parse_markdown(target.read_text("utf-8"))
+        except (ValueError, OSError) as e:
+            errors.append(("include_missing", f"{where}: {target}: {e}"))
+            out_lines.append((line_no, raw))
+            out_origins.append(filepath)
+            continue
+
+        params = metadata.get("params") or []
+        if not isinstance(params, list):
+            params = [params]
+        params = [str(param) for param in params]
+        try:
+            args = shlex.split(args_text) if args_text else []
+        except ValueError as e:
+            errors.append(("macro_params", f"{where}: {shown}: {e}"))
+            args = []
+        if len(args) != len(params):
+            errors.append(
+                (
+                    "macro_params",
+                    f"{where}: {shown} takes {len(params)} argument(s), got {len(args)}",
+                )
+            )
+
+        # bind declared params, then expand whatever the body still points at
+        text = inc_body
+        for name, value in zip(params, args, strict=False):
+            text = text.replace("{" + name + "}", value)
+        inner, inner_origins, inner_errors = expand_body(
+            list(enumerate(text.splitlines(), 1)),
+            target,
+            stack + (target,),
+            depth + 1,
+        )
+        out_lines += inner
+        out_origins += inner_origins
+        errors += inner_errors
+
+    return out_lines, out_origins, errors
 
 
 # ---------------------------------------------------------------------------
@@ -715,12 +836,13 @@ class VariantIR:
     filepath: Path
     pathname: str
     line: int
-    src: list[tuple[int, str]]  # raw body lines, for the regex-based checks
+    src: list[tuple[int, str]]  # expanded body lines, for the regex-based checks
     lines: list[list[dict]] = field(default_factory=list)  # lexed token lines
     block_error: str | None = None
     choices: list[ChoiceIR] = field(default_factory=list)
     effects: list[dict] = field(default_factory=list)
     unknown_keys: list[str] = field(default_factory=list)
+    expand_errors: list[tuple[str, str]] = field(default_factory=list)
     revisit: bool = True
     pace: str | None = None
     colour: str | None = None
@@ -976,20 +1098,25 @@ def find_parts() -> dict[str, NodeIR]:
             raise ValueError(f"{f}: {e}") from e
 
         body_lines = list(enumerate(body.splitlines(), 1))
+        expanded, origins, expand_errors = expand_body(body_lines, f)
         try:
-            lexed = lex_body(body_lines)
+            lexed = lex_body(expanded, node_file=f, origins=origins)
         except ValueError as e:
-            raise ValueError(f"{f}: {e}") from e
+            message = str(e)
+            if not message.startswith("story/"):
+                message = f"{f}: {message}"
+            raise ValueError(message) from e
         variant = VariantIR(
             filepath=f,
             pathname=pathname,
             line=1,
-            src=body_lines,
+            src=expanded,
             lines=lexed.lines,
             block_error=lexed.block_error,
             choices=choices,
             effects=effects,
             unknown_keys=unknown,
+            expand_errors=expand_errors,
             revisit=bool(metadata.get("revisit", True)),
         )
         for key, attr in PRESENTATION_KEYS.items():
@@ -1933,6 +2060,31 @@ def count_range(parts: dict[str, NodeIR]) -> list[VariantIR]:
     return nodes
 
 
+def _expansion_errors(parts: dict[str, NodeIR], kind: str) -> list[str]:
+    return [
+        message
+        for path in parts.values()
+        for part in path.variants
+        for error_kind, message in part.expand_errors
+        if error_kind == kind
+    ]
+
+
+def include_missing(parts: dict[str, NodeIR]) -> list[str]:
+    """{{...}} pointing at a missing or non-'_' file (design 1.8)"""
+    return _expansion_errors(parts, "include_missing")
+
+
+def macro_params(parts: dict[str, NodeIR]) -> list[str]:
+    """macro called with the wrong number of arguments (design 1.8)"""
+    return _expansion_errors(parts, "macro_params")
+
+
+def macro_recursion(parts: dict[str, NodeIR]) -> list[str]:
+    """macro cycle or nesting past the depth limit (design 1.8)"""
+    return _expansion_errors(parts, "macro_recursion")
+
+
 # ---------------------------------------------------------------------------
 # emit story.json v2 (design 2.1): serialization only, no decisions here
 # ---------------------------------------------------------------------------
@@ -2149,6 +2301,9 @@ def main() -> int:
         StoryCheck(missing_music, "parts referencing a missing music track", True),
         StoryCheck(unknown_keys, "parts with unknown frontmatter keys"),
         StoryCheck(count_range, "parts with count groups out of range"),
+        StoryCheck(include_missing, "parts including a missing or non-'_' file"),
+        StoryCheck(macro_params, "parts calling a macro with the wrong arguments"),
+        StoryCheck(macro_recursion, "parts with a macro cycle or deep nesting"),
     ]
 
     func_pad = 0

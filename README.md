@@ -40,7 +40,8 @@ Pass `-DEBUG` (or `-d`) to the generator for a line-by-line trace of what it did
 
 Each file in `story/` is one node. The filename (without `.md`) is the id other nodes link to.
 Put files in a subdirectory to make them variants of the same node; a variant is picked at random
-when the node is reached.
+when the node is reached. A file or folder whose name starts with `_` is not a node: shared
+menus, includes and macros live there.
 
 ```markdown
 ---
@@ -173,6 +174,43 @@ The path is relative to `story/`, minus `.md`, and must point at a `_` file; onl
 file's `choices:` list is merged (its other keys are ignored). The node's own choices
 come first, the merged ones follow, and a shared file may chain its own `choices_from`.
 Missing files and duplicate labels across the merged whole are build errors.
+
+## Includes and macros
+
+A paragraph, a greeting, a weather beat - written once and spliced into every page that
+names it, at build time:
+
+```markdown
+# story/_shared/omen.md - a plain include: a `_` file with a body, no front matter
+A crow watches from the wall.
+```
+
+```markdown
+# story/_macros/greet.md - a macro declares its parameters
+---
+params: [who]
+---
+/pov {who} Well met, {who}.
+```
+
+```markdown
+# in any node's body
+The gate swings open.
+{{_shared/omen}}
+{{_macros/greet Alice}}
+```
+
+The path follows the same rules as `choices_from`: relative to `story/`, minus `.md`, and a
+`_` prefix required. An include's body drops in exactly where the line sat; a macro binds its
+arguments to the braced names in its body first, so the argument above greets Alice by name.
+A macro body may include other files too, and `//` at the start of a line is a comment:
+stripped at build, it never reaches `story.json`.
+
+Expansion runs before validation, so reachability, marker checks and the reader all see the
+finished text, and a bad line inside a macro reports the chain it arrived through, like
+`story/_macros/greet.md:2 (via include-test.md): cannot parse effect ...`. A missing file, a
+wrong argument count, or a macro cycle stops the build (`include_missing`, `macro_params`,
+`macro_recursion`). See `story/include-test.md`.
 
 ## Automatic continuation
 
@@ -340,7 +378,7 @@ once your own media goes in.
 
 # Checks
 
-`python3 src/generate_story.py` runs 48 checks over the story. Failures (❌) stop generation and
+`python3 src/generate_story.py` runs 51 checks over the story. Failures (❌) stop generation and
 exit non-zero; warnings (⚠️) are printed but let the story through. CI runs the same generator,
 plus `ruff check` and `ruff format --check`, on every push and pull request, and deploys to
 GitHub Pages from `main`.
