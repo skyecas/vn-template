@@ -27,6 +27,7 @@ function emptyState() {
         used: [],
         rng: { seed: 0, n: 0 },
         call: [],
+        resume: [],
         povColours: {},
     };
 }
@@ -74,7 +75,23 @@ function sanitizeState(state) {
         if (Number.isInteger(state.rng.n) && state.rng.n >= 0) rng.n = state.rng.n;
     }
 
-    const call = Array.isArray(state.call) ? state.call.filter(c => typeof c === "string") : [];
+    // a stack record is {id, variant} (design 1.9); anything else is stale
+    const call = [];
+    if (Array.isArray(state.call)) {
+        for (const record of state.call) {
+            if (record && typeof record === "object" && typeof record.id === "string") {
+                const variant =
+                    Number.isInteger(record.variant) && record.variant >= 0
+                        ? record.variant
+                        : null;
+                call.push({ id: record.id, variant });
+            }
+        }
+    }
+
+    // resume is a boolean array parallel to path; links from before tunnels
+    // simply have no resume steps
+    const resume = path.map((_, i) => Array.isArray(state.resume) && state.resume[i] === true);
 
     const povColours = {};
     if (state.povColours && typeof state.povColours === "object" && !Array.isArray(state.povColours)) {
@@ -83,7 +100,7 @@ function sanitizeState(state) {
         }
     }
 
-    return { v: 2, path, variants, vars, visits, used, rng, call, povColours };
+    return { v: 2, path, variants, vars, visits, used, rng, call, resume, povColours };
 }
 
 // UTF-8 safe base64: string vars can hold any characters
@@ -407,6 +424,7 @@ function nodeVariant(node, index) {
 // append a node to the path and run its fresh-entry work (design 2.3 step 4)
 function enterNode(state, nodeId) {
     state.path.push(nodeId);
+    state.resume.push(false); // fresh entries are never resume steps
     const node = storyData.nodes[nodeId];
     if (!node) {
         state.variants.push(null); // the validator warns; render shows a placeholder
@@ -439,6 +457,17 @@ function applyTransition(state, action) {
         enterNode(next, nodeId);
         steps.push({ index: next.path.length - 1, nodeId, state: structuredClone(next) });
     };
+    // a resume step: the caller reappears with its choices only (design 1.9)
+    const resumeCaller = record => {
+        next.path.push(record.id);
+        next.variants.push(record.variant);
+        next.resume.push(true);
+        steps.push({
+            index: next.path.length - 1,
+            nodeId: record.id,
+            state: structuredClone(next),
+        });
+    };
 
     if (action.type === "start") {
         next.path = [];
@@ -447,6 +476,7 @@ function applyTransition(state, action) {
         next.visits = {};
         next.used = [];
         next.call = [];
+        next.resume = [];
         next.povColours = { ...(config.povColours || {}) };
         next.rng = { seed: action.seed ?? newSeed(), n: 0 };
         const starts = Object.keys(storyData.nodes).filter(id => storyData.nodes[id].start);
@@ -466,6 +496,13 @@ function applyTransition(state, action) {
         const node = storyData.nodes[nodeId];
         if (!node) return { state: next, steps: [] };
         const variant = nodeVariant(node, next.variants[next.variants.length - 1]);
+
+        // a terminator inside a tunnel pops back to the caller instead of
+        // offering restart (design 1.9)
+        if (action.type === "advance" && node.end && next.call.length) {
+            resumeCaller(next.call.pop());
+            return { state: next, steps };
+        }
 
         // next is unconditional: it wins over any choices on the node
         if (action.type === "advance" && liveNext(state, node)) {
@@ -495,6 +532,21 @@ function applyTransition(state, action) {
         if (choice.effects) {
             for (const effect of choice.effects) applyEffect(effect, next);
         }
+        if (choice.return) {
+            // effects ran first; an empty stack goes nowhere (design 1.9)
+            if (!next.call.length) return { state: next, steps: [] };
+            const record = next.call.pop();
+            if (choice.to) enter(choice.to);
+            else resumeCaller(record);
+            return { state: next, steps };
+        }
+        if (choice.call) {
+            // the record keeps the caller's id and picked variant (design 1.9)
+            next.call.push({
+                id: nodeId,
+                variant: next.variants[next.variants.length - 1],
+            });
+        }
         enter(choice.to);
         return { state: next, steps };
     }
@@ -517,8 +569,12 @@ function computeStepStates(target) {
     for (let i = 1; i < target.path.length; i++) {
         const prevId = current.path[current.path.length - 1];
         const node = storyData.nodes[prevId];
+        const stack = current.call.length ? current.call[current.call.length - 1] : null;
         let result = null;
-        if (node && liveNext(current, node) && node.next === target.path[i]) {
+        if (node && node.end && stack && stack.id === target.path[i]) {
+            // a pop: advancing the terminator resumes the caller (design 1.9)
+            result = applyTransition(current, { type: "advance" });
+        } else if (node && liveNext(current, node) && node.next === target.path[i]) {
             result = applyTransition(current, { type: "advance" });
         } else if (node) {
             const variant = nodeVariant(node, current.variants[current.variants.length - 1]);
@@ -527,6 +583,13 @@ function computeStepStates(target) {
             // effects are identical across same-target choices (design 1.3)
             const index = visible.findIndex(choice => choice.to === target.path[i]);
             if (index >= 0) result = applyTransition(current, { type: "choice", index });
+            else {
+                // a return choice pops to the caller without naming a target
+                const ret = visible.findIndex(choice => choice.return && !choice.to);
+                if (ret >= 0 && stack && stack.id === target.path[i]) {
+                    result = applyTransition(current, { type: "choice", index: ret });
+                }
+            }
         }
         if (!result || !result.steps.length) break; // stale link: render as far as it still makes sense
         current = result.state;
@@ -1308,8 +1371,11 @@ async function renderChoices(nodeContainer, state, storyIndex, node, variant, is
     const shown = fallbackOnly ? [] : choices;
 
     // an ending, or a node with no live exit, offers a restart instead; a
-    // node about to follow `next` shows nothing and continues on advance
-    const isEnd = node.end || (choices.length === 0 && !liveNext(state, node));
+    // node about to follow `next` shows nothing and continues on advance;
+    // an ending inside a tunnel shows nothing and pops on advance (design 1.9)
+    const tunneled = Boolean(node.end && state.call && state.call.length);
+    const isEnd =
+        !tunneled && (node.end || (choices.length === 0 && !liveNext(state, node)));
 
     const buttons = [];
 
@@ -1318,7 +1384,7 @@ async function renderChoices(nodeContainer, state, storyIndex, node, variant, is
         buttons.push(redoButton());
     }
     // otherwise, show the choices
-    else {
+    else if (!tunneled) {
         for (let i = 0; i < shown.length; i++) {
             const choice = shown[i];
             const choiceButton = document.createElement("button");
@@ -1376,6 +1442,13 @@ async function renderChoices(nodeContainer, state, storyIndex, node, variant, is
                 autoAdvanceTimer = null;
                 applyAndRender({ type: "advance" });
             }, delay);
+        } else if (tunneled && delay > 0) {
+            // no buttons at all: auto-advance performs the pop (design 1.9)
+            cancelAutoAdvance();
+            autoAdvanceTimer = setTimeout(() => {
+                autoAdvanceTimer = null;
+                applyAndRender({ type: "advance" });
+            }, delay);
         } else {
             // a linear node can follow its only choice on its own, so a story
             // reads hands-off; any reader input cancels it first
@@ -1400,11 +1473,20 @@ async function renderNode(state, storyIndex, node) {
     nodeContainer.className = "story-node";
     storyContainer.appendChild(nodeContainer);
 
+    const isCurrent = storyIndex >= stepStates.length - 1;
+
+    // a resume step shows the caller's choices only: no text, no effects, no
+    // variant re-pick (design 1.9); the tunnel transcript stays above it
+    if (state.resume && state.resume[storyIndex]) {
+        await renderChoices(nodeContainer, state, storyIndex, node, variant, isCurrent);
+        keepView();
+        return;
+    }
+
     // create the text
     await renderText(nodeContainer, state, node, variant, state.path[storyIndex]);
 
     // create the choices, if they exist
-    const isCurrent = storyIndex >= stepStates.length - 1;
     await renderChoices(nodeContainer, state, storyIndex, node, variant, isCurrent);
 
     // ensure we have scrolled enough

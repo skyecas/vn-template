@@ -133,7 +133,7 @@ if: has_key and (skill >= 5 or not alarmed)
 Expressions combine flag names, `not`, comparisons (`>`, `>=`, `<`, `<=`, `==`, `!=`),
 `and` / `or`, parentheses, and visit counters (`visited(node_id)`, `visits(node_id) >= 2`).
 
-Four optional keys on a choice shape how it behaves:
+Six optional keys on a choice shape how it behaves:
 
 - `effects:` - a list of effects run the moment the choice is picked, before the story moves on,
   written the same way as front matter effects (`coins +1`, `took_coin`, `player = "Skye"`)
@@ -144,6 +144,11 @@ Four optional keys on a choice shape how it behaves:
   reveals the same way
 - `fallback: true` - an ordinary button while any other choice is visible; when only fallbacks
   remain the page shows no buttons and the first one is taken on advance
+- `call: true` - push this node onto the call stack before following `to:`, so the target runs
+  as its own tunnel scene and the story pops back here when it ends (see Tunnels)
+- `return: true` - leave a tunnel early: run the choice's `effects`, pop one level and resume
+  the caller; `to:` may be omitted, and on an empty stack the choice does nothing
+  (`orphan_return` warns at build)
 
 See `story/effects-test.md` for `effects` + `once` and `story/chance-test.md` for `chance` +
 `fallback`.
@@ -211,6 +216,41 @@ finished text, and a bad line inside a macro reports the chain it arrived throug
 `story/_macros/greet.md:2 (via include-test.md): cannot parse effect ...`. A missing file, a
 wrong argument count, or a macro cycle stops the build (`include_missing`, `macro_params`,
 `macro_recursion`). See `story/include-test.md`.
+
+## Tunnels
+
+A tunnel is a scene that borrows the reader and gives them back: a choice with `call: true`
+pushes the current node onto a call stack and follows `to:` into a sub-scene that runs as its
+own story - front matter, variant pick, visits and effects all fresh. When the sub-scene
+reaches an `end:` page, the advance does not restart the story, it pops the stack and the
+caller reappears in the transcript with its choices ready again:
+
+```yaml
+# on a normal page's choices
+- label: Search the study
+  to: tunnel-search
+  call: true
+```
+
+```markdown
+# story/tunnel-search.md
+---
+end: true
+---
+The drawers are empty.
+```
+
+The caller returns as a *resume step* (`state.resume[i] = true`): its choices render at the
+bottom, but no text, no effects, no variant re-pick and no visit bump run a second time, so a
+`gold +1` on the caller cannot double-fire. A `return: true` choice leaves early - it runs its
+own `effects`, pops one level and resumes the caller, or enters `to:` fresh after the pop if
+one is named; on an empty stack it does nothing and the build warns (`orphan_return`).
+Tunnels nest: every `call` pushes a level, every terminator or `return` pops one.
+
+Every `call` target must be able to pop - a path to an `end:` page or a `return:` choice on
+all paths - or the build fails (`tunnel_no_end`), and an `end:` page may not also carry
+`next:` or choices. See `story/tunnel-test.md`, `story/tunnel-hall.md` and
+`story/tunnel-search.md`.
 
 ## Automatic continuation
 
@@ -378,7 +418,7 @@ once your own media goes in.
 
 # Checks
 
-`python3 src/generate_story.py` runs 51 checks over the story. Failures (❌) stop generation and
+`python3 src/generate_story.py` runs 53 checks over the story. Failures (❌) stop generation and
 exit non-zero; warnings (⚠️) are printed but let the story through. CI runs the same generator,
 plus `ruff check` and `ruff format --check`, on every push and pull request, and deploys to
 GitHub Pages from `main`.

@@ -42,6 +42,10 @@ def render(state: dict[str, Any]) -> None:
     if node is None:
         print("  (missing node - the save may be stale)")
         return
+    if state.get("resume") and state["resume"][-1]:
+        # a resume step shows its choices only (design 1.9); the tunnel
+        # transcript is already on screen
+        return
     variant = node_variant(node, state["variants"][-1] if state["variants"] else None)
     for speaker, text in display_lines(state, node, variant, node_id):
         print(f"  [{speaker}] {text}" if speaker else f"  {text}")
@@ -70,7 +74,11 @@ def prompt(
         elif visible:
             mode = "fallback"  # no buttons: the first fallback is taken
         elif node.get("end"):
-            print("\n[end of story]")
+            if state.get("call"):
+                mode = "advance"
+                print("\n[Enter] return to the caller")
+            else:
+                print("\n[end of story]")
         else:
             print("\n(no visible choices - dead end)")
 

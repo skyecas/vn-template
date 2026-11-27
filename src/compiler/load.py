@@ -40,11 +40,21 @@ NODE_KEYS = {
     "choices",
     "choices_from",
 }
-CHOICE_KEYS = {"label", "to", "if", "effects", "once", "chance", "fallback"}
+CHOICE_KEYS = {
+    "label",
+    "to",
+    "if",
+    "effects",
+    "once",
+    "chance",
+    "fallback",
+    "call",
+    "return",
+}
 
 
 def parse_choices(raw: Any, filepath: Path, unknown: list[str]) -> list[ChoiceIR]:
-    """choices is a list of {label, to, if, effects, once, chance, fallback}"""
+    """choices is a list of {label, to, if, effects, once, chance, fallback, call, return}"""
     if raw is None:
         return []
     if not isinstance(raw, list):
@@ -60,7 +70,15 @@ def parse_choices(raw: Any, filepath: Path, unknown: list[str]) -> list[ChoiceIR
 
         label = entry.get("label")
         target = entry.get("to")
-        if not label or not target:
+        call = bool(entry.get("call", False))
+        returns = bool(entry.get("return", False))
+        if not label:
+            raise ValueError(f"choice {i + 1} needs a label")
+        if call and returns:
+            raise ValueError(f"choice {i + 1} cannot be both call and return")
+        if call and not target:
+            raise ValueError(f"choice {i + 1} call needs a to")
+        if not target and not returns:
             raise ValueError(f"choice {i + 1} needs both a label and a to")
         for key in entry:
             if key not in CHOICE_KEYS:
@@ -91,13 +109,15 @@ def parse_choices(raw: Any, filepath: Path, unknown: list[str]) -> list[ChoiceIR
         choices.append(
             ChoiceIR(
                 label=str(label),
-                target=str(target),
+                target=str(target) if target else None,
                 file=filepath,
                 cond=parse_condition(entry.get("if")),
                 effects=effects,
                 once=bool(entry.get("once", False)),
                 chance=chance,
                 fallback=bool(entry.get("fallback", False)),
+                call=call,
+                return_=returns,
             )
         )
 

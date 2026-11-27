@@ -1,5 +1,8 @@
 ---
 revisit: true
+choices:
+    - label: How do I send the reader somewhere and get them back
+      to: tunnel-test
 choices_from: _shared/menu
 ---
 

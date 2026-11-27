@@ -188,7 +188,7 @@ def invalid_links(parts: dict[str, NodeIR]) -> list[VariantIR]:
             if broken_next:
                 debug(f"{part.pathname}: next {path.next} was not in {parts.keys()}")
             for choice in part.choices:
-                if choice.target not in parts:
+                if choice.target is not None and choice.target not in parts:
                     debug(f"{part.pathname}: {choice.target} was not in {parts.keys()}")
                     bad = True
                     break
@@ -453,7 +453,8 @@ def continuing_ends(parts: dict[str, NodeIR]) -> list[VariantIR]:
     for path in parts.values():
         if path.is_end:
             for part in path.variants:
-                if part.choices:
+                # an end with a next: is dead config the renderer ignores (1.9)
+                if part.choices or path.next:
                     nodes.append(part)
     return nodes
 
@@ -967,3 +968,76 @@ def macro_params(parts: dict[str, NodeIR]) -> list[str]:
 def macro_recursion(parts: dict[str, NodeIR]) -> list[str]:
     """macro cycle or nesting past the depth limit (design 1.8)"""
     return _expansion_errors(parts, "macro_recursion")
+
+
+def tunnel_no_end(parts: dict[str, NodeIR]) -> list[VariantIR]:
+    """a call target the reader can get stuck inside (design 1.9)"""
+    forward: dict[str, set[str]] = {name: set() for name in parts}
+    for name, node in parts.items():
+        if node.next and not node.is_end and node.next in parts:
+            forward[name].add(node.next)
+        for variant in node.variants:
+            for choice in variant.choices:
+                if choice.target in parts:
+                    forward[name].add(choice.target)
+
+    # the tunnel pops at an end: node or at a return choice (design 1.9)
+    can_pop = {
+        name
+        for name, node in parts.items()
+        if node.is_end
+        or any(
+            choice.return_ for variant in node.variants for choice in variant.choices
+        )
+    }
+    reverse: dict[str, set[str]] = {name: set() for name in parts}
+    for name, targets in forward.items():
+        for target in targets:
+            reverse[target].add(name)
+    stack = list(can_pop)
+    while stack:
+        name = stack.pop()
+        for caller in reverse[name]:
+            if caller not in can_pop:
+                can_pop.add(caller)
+                stack.append(caller)
+
+    nodes = []
+    for name, node in parts.items():
+        stuck: set[str] = set()
+        for variant in node.variants:
+            for choice in variant.choices:
+                if not choice.call or choice.target not in parts:
+                    continue
+                seen: set[str] = set()
+                todo = [choice.target]
+                while todo:
+                    current = todo.pop()
+                    if current in seen:
+                        continue
+                    seen.add(current)
+                    if current not in can_pop:
+                        stuck.add(current)
+                    todo.extend(forward[current] - seen)
+        if stuck:
+            debug(f"{name}: call never pops, stuck at {sorted(stuck)}")
+            nodes.extend(node.variants)
+    return nodes
+
+
+def orphan_return(parts: dict[str, NodeIR]) -> list[VariantIR]:
+    """a return choice in a node no call targets (design 1.9)"""
+    called = {
+        choice.target
+        for node in parts.values()
+        for variant in node.variants
+        for choice in variant.choices
+        if choice.call and choice.target
+    }
+    return [
+        variant
+        for name, node in parts.items()
+        if name not in called
+        for variant in node.variants
+        if any(choice.return_ for choice in variant.choices)
+    ]

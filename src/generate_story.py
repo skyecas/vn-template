@@ -44,6 +44,7 @@ from compiler.checks import (
     missing_music,
     missing_sfx,
     noncontinuing_variants,
+    orphan_return,
     pace_markers,
     pace_metadata,
     pause_markers,
@@ -56,6 +57,7 @@ from compiler.checks import (
     single_choice,
     start_end_nodes,
     starting_nodes,
+    tunnel_no_end,
     unknown_keys,
     unknown_markers,
     unknown_names,
@@ -124,7 +126,7 @@ def main() -> int:
         ),
         StoryCheck(condition_syntax, "parts with unparseable conditions"),
         StoryCheck(conditional_blocks, "parts with unbalanced /if blocks"),
-        StoryCheck(continuing_ends, "ending parts contain choices"),
+        StoryCheck(continuing_ends, "ending parts with choices or next"),
         StoryCheck(noncontinuing_variants, "parts with choices on only some variants"),
         StoryCheck(revisit_variants, "parts are revisitable while others aren't"),
         StoryCheck(single_choice, "parts with a single choice", False),
@@ -171,6 +173,8 @@ def main() -> int:
         StoryCheck(include_missing, "parts including a missing or non-'_' file"),
         StoryCheck(macro_params, "parts calling a macro with the wrong arguments"),
         StoryCheck(macro_recursion, "parts with a macro cycle or deep nesting"),
+        StoryCheck(tunnel_no_end, "parts calling a tunnel that can never pop"),
+        StoryCheck(orphan_return, "parts with a return no call reaches", False),
     ]
 
     func_pad = 0

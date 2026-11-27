@@ -265,13 +265,13 @@ He finds nothing.
 - Flow: click -> push -> sub-scene runs normally (edges, `next`, effects, choices) -> terminator text reveals -> advance (or `autoAdvance`) performs the pop -> caller's choices offer again
 - **Push:** `call: true` requires `to:`; the stack record is `{id, variant}` - the caller's id and its picked variant at push time; the sub-node then enters fresh (front matter, variant pick, visits all run)
 - **Pop:** on an `end:` node with a non-empty call stack, advance pops instead of offering restart; the caller is appended to the path as a *resume step* (`state.resume[i] = true`) that renders **its choices only** - no text, no effects, no variant re-pick, no visit increment, no rng draws (the transcript keeps the tunnel content above it)
-- **Early exit:** choice-level `return: true` (a reader decision, not bookkeeping); it runs its own `effects` first, then pops one level, and may omit `to:`; an empty stack means no navigation (`orphan_return` warns at build)
+- **Early exit:** choice-level `return: true` (a reader decision, not bookkeeping); it runs its own `effects` first, then pops one level; with `to:` the pop is followed by a fresh entry into `to:`, without it the caller resumes as a resume step; an empty stack means no navigation (`orphan_return` warns at build). `call: true` and `return: true` cannot share a choice
 - **Resume rule:** a return transition does not re-apply the caller's effects and does not re-pick its variant (only fresh-entry transitions do); `gold +1` on the caller cannot double-fire
 - **State:** `call` is a stack of `{id, variant}` records in the state blob; `resume` is a boolean array parallel to `path`; shared links and saves replay resume steps by popping (`computeStepStates`)
 - **Nested tunnels:** pop one level per terminator; `call` is a stack in the state blob
 - **Gallery:** an `end:` node records a finishing only when the stack was empty
 - **Rendering intent:** tunnel content appends to the log transcript-style; after the pop, the caller's choices render at the bottom (refine in P2; no DOM snapshotting)
-- **Validator:** every `call` target must reach an `end:` on all paths (tunnel-never-pops = trap); `return` choice in a node no `call` targets = warning; `end:` with `next:`/choices = error (extends `continuing_ends`)
+- **Validator:** every `call` target must reach an `end:` or a `return` choice on all paths (tunnel-never-pops = trap; a `return` pops the same way); `return` choice in a node no `call` targets = warning; `end:` with `next:`/choices = error (extends `continuing_ends`)
 
 **Reuse matrix:**
 
@@ -426,7 +426,7 @@ All **44 existing checks migrate** to the IR (conditions are now ASTs, not regex
 | `set_but_never_read` | warning | names set but never tested or displayed |
 | `satisfiability` | error | never-true conditions: `a and not a`, `exactly N` > len, flags only set behind their own negation (memoised walk over the flag/var domain; `count` nodes are cheap predicates inside it) |
 | `chance_only_exit` | warning | `chance` on the node's only visible exit |
-| `tunnel_no_end` | error | `call` target that cannot reach `end:` on all paths |
+| `tunnel_no_end` | error | `call` target with no path to `end:` or a `return` |
 | `orphan_return` | warning | `return` choice in a node no `call` targets |
 | `choices_from_clash` | error | duplicate labels after merging |
 | `macro_recursion` | error | macro cycle / depth overflow |

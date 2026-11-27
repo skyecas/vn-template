@@ -13,7 +13,7 @@ from pathlib import Path
 @dataclass
 class ChoiceIR:
     label: str
-    target: str
+    target: str | None
     file: Path
     line: int = 1
     cond: dict | None = None
@@ -21,6 +21,8 @@ class ChoiceIR:
     once: bool = False
     chance: int = 100
     fallback: bool = False
+    call: bool = False
+    return_: bool = False
 
 
 @dataclass

@@ -33,6 +33,8 @@ def emit_variant(variant: VariantIR) -> dict[str, Any]:
                 "once": choice.once,
                 "chance": choice.chance,
                 "fallback": choice.fallback,
+                "call": choice.call,
+                "return": choice.return_,
             }
             | ({"if": choice.cond} if choice.cond else {})
             | ({"effects": choice.effects} if choice.effects else {})

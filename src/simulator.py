@@ -69,6 +69,7 @@ def empty_state() -> dict[str, Any]:
         "used": [],
         "rng": {"seed": 0, "n": 0},
         "call": [],
+        "resume": [],
         "povColours": {},
     }
 
@@ -497,6 +498,7 @@ def visible_choices(
 
 def enter_node(state: dict[str, Any], node_id: str) -> None:
     state["path"].append(node_id)
+    state["resume"].append(False)  # fresh entries are never resume steps
     node = story["nodes"].get(node_id)
     if node is None:
         state["variants"].append(
@@ -523,6 +525,8 @@ def apply_transition(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """the one place state changes: pure with respect to the caller's blob"""
     nxt = copy.deepcopy(state)
+    if not isinstance(nxt.get("resume"), list):  # a save from before tunnels
+        nxt["resume"] = [False] * len(nxt["path"])
     steps: list[dict[str, Any]] = []
 
     def enter(node_id: str) -> None:
@@ -535,6 +539,19 @@ def apply_transition(
             }
         )
 
+    def resume_call(record: dict[str, Any]) -> None:
+        """the caller reappears with its choices only (design 1.9)"""
+        nxt["path"].append(record["id"])
+        nxt["variants"].append(record.get("variant"))
+        nxt["resume"].append(True)
+        steps.append(
+            {
+                "index": len(nxt["path"]) - 1,
+                "nodeId": record["id"],
+                "state": copy.deepcopy(nxt),
+            }
+        )
+
     kind = action.get("type")
     if kind == "start":
         nxt["path"] = []
@@ -543,6 +560,7 @@ def apply_transition(
         nxt["visits"] = {}
         nxt["used"] = []
         nxt["call"] = []
+        nxt["resume"] = []
         nxt["povColours"] = dict(config.get("povColours") or {})
         seed = action.get("seed")
         nxt["rng"] = {
@@ -570,6 +588,12 @@ def apply_transition(
         if node is None:
             return nxt, steps
         variant = node_variant(node, nxt["variants"][-1])
+
+        # a terminator inside a tunnel pops back to the caller instead of
+        # offering restart (design 1.9)
+        if kind == "advance" and node.get("end") and nxt["call"]:
+            resume_call(nxt["call"].pop())
+            return nxt, steps
 
         # next is unconditional: it wins over any choices on the node
         if kind == "advance" and live_next(state, node):
@@ -605,6 +629,19 @@ def apply_transition(
                 nxt["used"].append(key)
         for effect in choice.get("effects") or []:
             apply_effect(effect, nxt)
+        if choice.get("return"):
+            # effects ran first; an empty stack goes nowhere (design 1.9)
+            if not nxt["call"]:
+                return nxt, steps
+            record = nxt["call"].pop()
+            if choice.get("to"):
+                enter(choice["to"])
+            else:
+                resume_call(record)
+            return nxt, steps
+        if choice.get("call"):
+            # the record keeps the caller's id and picked variant (design 1.9)
+            nxt["call"].append({"id": node_id, "variant": nxt["variants"][-1]})
         enter(choice["to"])
         return nxt, steps
 
@@ -629,8 +666,12 @@ def compute_step_states(target: dict[str, Any]) -> list[dict[str, Any]]:
     for i in range(1, len(target["path"])):
         prev_id = current["path"][-1]
         node = story["nodes"].get(prev_id)
+        stack = current["call"][-1] if current.get("call") else None
         result = None
-        if node and live_next(current, node) and node["next"] == target["path"][i]:
+        if node and node.get("end") and stack and stack["id"] == target["path"][i]:
+            # a pop: advancing the terminator resumes the caller (design 1.9)
+            result = apply_transition(current, {"type": "advance"})
+        elif node and live_next(current, node) and node["next"] == target["path"][i]:
             result = apply_transition(current, {"type": "advance"})
         elif node:
             variant = node_variant(node, current["variants"][-1])
@@ -649,6 +690,18 @@ def compute_step_states(target: dict[str, Any]) -> list[dict[str, Any]]:
             )
             if index >= 0:
                 result = apply_transition(current, {"type": "choice", "index": index})
+            else:
+                # a return choice pops to the caller without naming a target
+                ret = next(
+                    (
+                        position
+                        for position, (_, choice) in enumerate(visible)
+                        if choice.get("return") and not choice.get("to")
+                    ),
+                    -1,
+                )
+                if ret >= 0 and stack and stack["id"] == target["path"][i]:
+                    result = apply_transition(current, {"type": "choice", "index": ret})
         if not result or not result[1]:
             break  # stale link: render as far as it still makes sense
         current = result[0]
@@ -772,7 +825,7 @@ def run_sim(walks: int, max_steps: int = 300) -> None:
             if node is None:
                 outcome = ("stuck", node_id)
                 break
-            if node.get("end"):
+            if node.get("end") and not state["call"]:
                 outcome = ("end", node_id)
                 break
             variant = node_variant(node, state["variants"][-1])
@@ -784,6 +837,8 @@ def run_sim(walks: int, max_steps: int = 300) -> None:
             ]
             if live_next(state, node):
                 action: dict[str, Any] = {"type": "advance"}
+            elif node.get("end") and state["call"]:
+                action = {"type": "advance"}  # the pop (design 1.9)
             elif not visible:
                 outcome = ("stuck", node_id)
                 break
