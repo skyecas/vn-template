@@ -386,6 +386,10 @@ story/*.md
   optional: --sim N | --dot | --report | --watch | --github
 ```
 
+Code layout mirrors the stages: `src/generate_story.py` is the thin entry (argv, check registry,
+runner); `src/compiler/` holds one module per stage or concept - `patterns`, `conditions`,
+`effects`, `frontmatter`, `lexer`, `expand`, `ir`, `load`, `checks`, `emit`, `report`.
+
 ### 3.2 IR sketch
 
 ```
